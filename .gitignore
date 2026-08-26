@@ -1,0 +1,35 @@
+# Real secret (must match the Mac Mini's ocr_agent_secret) + your own
+# calibrated screen region - both machine/deployment-specific, neither
+# belongs in git. If you ever add an agent_config.example.json template,
+# that file is NOT covered by this pattern - only the exact filename
+# "agent_config.json" is ignored.
+agent_config.json
+
+# Python virtual environment (if you set one up for this project too)
+venv/
+.venv/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Test cache
+.pytest_cache/
+
+# Python packaging artifacts (unlikely to apply here, standard precaution)
+*.egg-info/
+dist/
+build/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# macOS (in case this folder is ever browsed from a Mac too)
+.DS_Store
+
+# Editor
+.vscode/
+.idea/

@@ -1,0 +1,17 @@
+# For the gaming PC (Windows), a completely separate Python environment
+# from the Mac Mini backend - install with:
+#   pip install -r requirements.txt
+#
+# Deliberately NOT pinned to an exact version like the Mac Mini's
+# requirements.txt is - that caused real, extended trouble there (a pin
+# that predated the installed Python version entirely, forcing a broken
+# source build). This machine's Python version is unknown in advance, so
+# a minimum-version constraint lets pip resolve to whatever's actually
+# compatible, rather than risk the same failure mode again.
+Pillow>=11.0.0
+requests>=2.31.0
+keyboard>=0.13.5
+
+# tkinter (used by calibrate.py) is part of Python's standard library,
+# not installed via pip - it comes bundled with the standard python.org
+# Windows installer by default, no separate step needed.
