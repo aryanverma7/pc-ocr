@@ -46,6 +46,25 @@ class TestCaptureAndSend:
 
     @patch("agent.requests.post")
     @patch("agent.ImageGrab.grab")
+    def test_an_already_cropped_image_is_sent_as_is_without_grabbing_again(self, mock_grab, mock_post):
+        """
+        The main loop crops on its own timing tick and hands the crop to a
+        worker (fix #5/#6), so this must neither re-grab nor re-crop - a
+        second crop would slice a region-sized offset out of an already
+        region-sized image.
+        """
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"credits": 4900})
+        already_cropped = Image.new("RGB", (150, 45))
+
+        agent.capture_and_send(make_config(), cropped=already_cropped)
+
+        mock_grab.assert_not_called()
+        from io import BytesIO
+        sent_image = Image.open(BytesIO(mock_post.call_args.kwargs["data"]))
+        assert sent_image.size == (150, 45)
+
+    @patch("agent.requests.post")
+    @patch("agent.ImageGrab.grab")
     def test_handles_a_network_failure_without_crashing(self, mock_grab, mock_post):
         import requests
         mock_grab.return_value = Image.new("RGB", (1920, 1080))

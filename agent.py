@@ -21,12 +21,14 @@ validated reading, since credits only ever go down as you spend), means
 the stored value naturally converges on your true final balance without
 needing to remember to keep the menu open.
 
-Real-world fix #3: a genuinely NEW buy phase (not just re-opening the
-same one) tells the Mac Mini to clear its reading history via
-reset_history() - without this, the previous round's readings were still
-sitting in the consensus window, contaminating the new round's
-consensus. Consuming BurstTimer's fresh-start flag is what correctly
-distinguishes "new round" from "same round, re-opened."
+Real-world fix #3: starting a burst tells the Mac Mini to clear its
+reading history via reset_history() - without this, the previous
+round's readings were still sitting in the consensus window,
+contaminating the new round's consensus. Consuming BurstTimer's
+fresh-start flag is what makes that fire once per press rather than
+once per capture tick. (This originally fired only for a burst that
+started from idle, on the theory that re-opening the same menu should
+keep its earlier readings; fix #6 below reverses that.)
 
 Real-world fix #4: rather than always waiting out the full burst
 duration, a run of consecutive "no number found" responses is treated as
@@ -40,6 +42,25 @@ burst at all); once fix #5 below made 4/sec real, holding 16 would have
 meant waiting 4 seconds to notice a closed menu. Retuned to keep the
 wall-clock delay roughly where it should be rather than letting a
 capture-rate change quietly redefine it.
+
+Real-world fix #6, from a real log: after "10 consecutive 'no number
+found' responses - assuming the buy menu already closed, ending this
+burst early", nine MORE 422s kept printing. The early exit stops the
+main loop capturing, but it does nothing about screenshots already
+sitting in the thread pool's queue - that queue is unbounded, so
+whenever the Mac Mini's round trip is slower than the 0.25s tick a
+backlog builds up, and every item in it still gets POSTed after the
+burst is over. Log noise is the mild half; the real problem is that one
+of those late frames can OCR to a genuine number and land in the
+consensus window after the menu closed.
+
+Each capture is now stamped with BurstTimer's generation, and the worker
+drops anything whose burst has ended or been superseded before it makes
+the network call. The same mechanism handles the other half of the
+report: pressing B again now cancels the burst in progress and starts a
+clean one (see burst_timer.py's own fix #6 for why that reverses the
+earlier "a re-press is an extension" rule), which both resets the Mac
+Mini's history and invalidates the previous generation's queued work.
 
 Requires calibrate.py to have been run at least once first, and
 agent_secret in agent_config.json to match the Mac Mini's own
@@ -112,19 +133,23 @@ class ConsecutiveFailureTracker:
         self._count = 0
 
 
-def capture_and_send(config: dict, screenshot=None) -> "int | None":
+def capture_and_send(config: dict, cropped=None) -> "int | None":
     """
     Returns the response's HTTP status code, or None if the request itself
-    failed (network error). Accepts an already-captured screenshot (see
-    fix #5 above) so the grab itself always happens on the main loop's own
-    precise timing tick rather than whenever a worker thread happens to
-    get scheduled - callers that don't care about that precision (the
-    existing tests included) can still omit it and let this grab fresh,
-    same as before.
+    failed (network error). Accepts an already-cropped image (see fix #5
+    above) so the grab happens on the main loop's own precise timing tick
+    rather than whenever a worker thread gets scheduled - callers that
+    don't care about that precision (the existing tests included) can omit
+    it and let this grab fresh, same as before.
+
+    The CROP, not the full screenshot, is what gets handed over. A queued
+    full-screen grab is around 6 MB of RGB at 1080p, so a backlog of a
+    dozen is most of a gigabyte held in memory for no reason; the crop is
+    a few hundred pixels. Cropping costs the main loop almost nothing next
+    to the grab it already does.
     """
-    if screenshot is None:
-        screenshot = ImageGrab.grab()
-    cropped = crop_to_region(screenshot, config["region"])
+    if cropped is None:
+        cropped = crop_to_region(ImageGrab.grab(), config["region"])
 
     buffer = io.BytesIO()
     cropped.save(buffer, format="PNG")
@@ -183,7 +208,28 @@ def main():
     # design) would otherwise crash here with a KeyError.
     burst_duration = config.get("burst_duration_seconds", 20)
     burst = BurstTimer(duration_seconds=burst_duration)
-    keyboard.on_press_key("b", lambda _: burst.trigger())
+
+    # Only a genuine down-transition counts as a press. Holding B makes the
+    # OS emit a repeating stream of key-down events, and since every trigger
+    # now cancels the burst in progress and resets the Mac Mini's history
+    # (fix #6), letting auto-repeat through would restart the burst dozens of
+    # times a second and never accumulate a single reading. Tracking the
+    # release is exact, where a timing-based debounce would only be a guess.
+    b_is_down = False
+
+    def on_b_down(_):
+        nonlocal b_is_down
+        if b_is_down:
+            return
+        b_is_down = True
+        burst.trigger()
+
+    def on_b_up(_):
+        nonlocal b_is_down
+        b_is_down = False
+
+    keyboard.on_press_key("b", on_b_down)
+    keyboard.on_release_key("b", on_b_up)
 
     print(f"Watching for 'B' (buy menu) - capturing for up to {burst_duration}s each time it's pressed.")
     print(f"Sending to {config['backend_url']}")
@@ -197,8 +243,16 @@ def main():
     tracker_lock = threading.Lock()
     executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS, thread_name_prefix="ocr-send")
 
-    def send_in_background(cfg: dict, screenshot) -> None:
-        status = capture_and_send(cfg, screenshot=screenshot)
+    def send_in_background(cfg: dict, cropped, generation: int) -> None:
+        # Checked HERE, in the worker, not at submit time - the whole point
+        # is that this work may have sat in the pool's unbounded queue while
+        # the burst it belongs to ended or was cancelled by a new B press.
+        # Sending it anyway is not just log noise: a frame captured after
+        # the menu closed can still OCR to a real number and land in the Mac
+        # Mini's consensus window.
+        if not burst.is_current(generation):
+            return
+        status = capture_and_send(cfg, cropped=cropped)
         with tracker_lock:
             failure_tracker.record_status(status)
             if failure_tracker.should_early_exit():
@@ -222,8 +276,8 @@ def main():
                     last_capture_at = now
                     # Grab happens right here, on-schedule, every tick -
                     # never delayed by a busy worker or a slow backend.
-                    screenshot = ImageGrab.grab()
-                    executor.submit(send_in_background, config, screenshot)
+                    cropped = crop_to_region(ImageGrab.grab(), config["region"])
+                    executor.submit(send_in_background, config, cropped, burst.generation)
 
                 time.sleep(0.05)
             else:
