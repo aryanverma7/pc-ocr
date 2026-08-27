@@ -59,7 +59,15 @@ def default_config() -> dict:
     return {
         "backend_url": "https://hub.dualbladex.org/api/ocr/credit-report",
         "agent_secret": "",
-        "burst_duration_seconds": 6,
+        # Long enough to cover a whole Valorant buy phase rather than the
+        # first few seconds of one. It was 6, which is shorter than the
+        # shopping itself: the burst expired while the menu was still open,
+        # so the final "min next round" - the only reading that is actually
+        # true - was never captured. Nothing depends on this being tight
+        # any more, because a burst now ends the moment the menu closes,
+        # either from the B press that closed it (burst_timer.py's fix #8)
+        # or from the run of unreadable frames that follows an Esc.
+        "burst_duration_seconds": 30,
         "region": None,
     }
 

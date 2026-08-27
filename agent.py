@@ -71,6 +71,30 @@ dashboard's OCR row reports, so "is the gaming PC ready" is answerable
 before a stream rather than after the first !roulette comes back with the
 full roster because no credits were ever read.
 
+Real-world fix #8, reported from a live round: the agent printed real
+readings and the admin dashboard still said "No reading yet". B is a
+toggle - the key that opens Valorant's buy menu is the key that closes
+it - and fix #6's "every press is a fresh start" rule fired on the close
+just as hard as on the open. So finishing a buy phase reset the Mac
+Mini's reading history, throwing away the numbers that had just been
+read correctly, and started a fresh burst aimed at a menu that was no
+longer on screen. See burst_timer.py's own fix #8: a press during an
+active burst is now the close of that burst, not the start of another.
+
+Real-world fix #9, the other half of the same report: closing the menu
+quickly sometimes produced no reading at all. Three separate causes, all
+of them wall-clock dead time rather than anything to do with OCR
+quality. The idle loop only checked for a new burst every 0.5s, so up to
+half a second could pass between pressing B and the first screenshot;
+the capture rate itself was 4/sec, so a two-second look yielded eight
+frames, several of which land on the menu's fade-in; and the Mac Mini
+ran Tesseract directly on its event loop, which capped the real
+end-to-end rate no matter what this file asked for. The idle check is
+now 0.05s, the rate is 10/sec, and the Mac Mini runs OCR in a thread
+pool. The constants derived from the capture rate were retuned with it -
+see CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT below and credit_ocr.py's
+_READING_HISTORY_SIZE on the other machine.
+
 Requires calibrate.py to have been run at least once first, and
 agent_secret in agent_config.json to match the Mac Mini's own
 ocr_agent_secret in config.json exactly - they're the same value on
@@ -93,13 +117,36 @@ from PIL import ImageGrab
 from burst_timer import BurstTimer
 from region import load_config, is_calibrated, crop_to_region
 
-CAPTURE_INTERVAL_WITHIN_BURST = 0.25  # 4 images/second
-IDLE_CHECK_INTERVAL = 0.5  # how often to check whether a burst just started, while idle
-# 2.5 seconds at the 4/sec rate above - see fix #4. Keep these two
+CAPTURE_INTERVAL_WITHIN_BURST = 0.1  # 10 images/second
+
+# Raised from 4/sec for fix #9. A buy menu that is opened and closed in a
+# couple of seconds used to yield about eight frames, and the first few of
+# those land on the menu's fade-in where the label isn't fully drawn yet -
+# so a fast look could genuinely produce nothing readable. Ten a second
+# makes the same two-second look about twenty frames.
+#
+# This rate is only honest because the Mac Mini stopped running Tesseract
+# on its event loop at the same time (credit_ocr.py's own fix). Asking for
+# a rate the backend can't retire doesn't raise the real one; it just
+# builds a queue here, and every frame in that queue is dropped at the end
+# of the burst anyway.
+IDLE_CHECK_INTERVAL = 0.05  # how often to check whether a burst just started, while idle
+
+# Was 0.5s, which meant up to half a second of a short buy phase elapsed
+# between the keypress and the first screenshot - dead time at exactly the
+# moment that matters least to lose. This loop does nothing but read a
+# float and compare it, so checking ten times more often costs nothing
+# measurable next to the screenshots it gates.
+
+# 1.5 seconds at the 10/sec rate above - see fix #4. Keep these two
 # constants in step: this is a duration expressed in readings, so changing
 # CAPTURE_INTERVAL_WITHIN_BURST without changing this silently changes how
-# long the agent waits before deciding the buy menu closed.
-CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 10
+# long the agent waits before deciding the buy menu closed. Tightened from
+# 2.5s along with the rate change, because a B-press close now ends the
+# burst outright (fix #8) and this threshold only has to cover the case
+# where the menu was closed some other way - the shorter it is, the
+# smaller the window in which a genuine re-open gets mistaken for a close.
+CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 15
 
 # Real-world fix #5: the 0.25s interval above was already "4 images/second"
 # on paper, but the loop used to call capture_and_send() - screenshot AND
@@ -112,7 +159,13 @@ CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 10
 # loop's own precise 0.25s tick (see main() below), but the slow part -
 # encode + POST + status handling - is handed off to a small bounded
 # thread pool so a slow backend response never delays the next screenshot.
-MAX_CONCURRENT_REQUESTS = 4  # in-flight requests before new ones queue behind them
+MAX_CONCURRENT_REQUESTS = 8  # in-flight requests before new ones queue behind them
+
+# Doubled with the capture rate. This is the real ceiling on the achieved
+# rate: with four workers and a round trip near half a second, no more
+# than eight requests a second can ever be retired however often the loop
+# grabs a frame, so leaving it at four would have quietly capped fix #9's
+# 10/sec back down at the old number.
 
 # Three of these fit inside the Mac Mini's own 45-second staleness window
 # (ocr_agent.HEARTBEAT_TIMEOUT_SECONDS), so a couple of dropped pings in a
@@ -280,15 +333,15 @@ def main():
     # agent_config.json from before this field was renamed (originally
     # capture_interval_seconds, used for a different, now-removed timer
     # design) would otherwise crash here with a KeyError.
-    burst_duration = config.get("burst_duration_seconds", 20)
+    burst_duration = config.get("burst_duration_seconds", 30)
     burst = BurstTimer(duration_seconds=burst_duration)
 
     # Only a genuine down-transition counts as a press. Holding B makes the
-    # OS emit a repeating stream of key-down events, and since every trigger
-    # now cancels the burst in progress and resets the Mac Mini's history
-    # (fix #6), letting auto-repeat through would restart the burst dozens of
-    # times a second and never accumulate a single reading. Tracking the
-    # release is exact, where a timing-based debounce would only be a guess.
+    # OS emit a repeating stream of key-down events, and a trigger is now a
+    # toggle (fix #8) - so letting auto-repeat through would open and close
+    # the same burst dozens of times a second and never accumulate a single
+    # reading. Tracking the release is exact, where a timing-based debounce
+    # would only be a guess.
     b_is_down = False
 
     def on_b_down(_):
@@ -296,7 +349,13 @@ def main():
         if b_is_down:
             return
         b_is_down = True
-        burst.trigger()
+        if burst.trigger():
+            print("Buy menu opened - capturing.")
+        else:
+            # Not a silent event: this is the press that used to destroy the
+            # readings it had just taken, so it is worth being able to see it
+            # happen in the log next to the numbers it now preserves.
+            print("Buy menu closed - keeping this phase's readings.")
 
     def on_b_up(_):
         nonlocal b_is_down

@@ -149,19 +149,42 @@ class TestConsecutiveFailureTracker:
         tracker.reset()
         assert tracker.should_early_exit() is False
 
-    def test_the_threshold_is_ten_readings_about_2_5_seconds_at_the_real_capture_rate(self):
+    def test_the_threshold_is_a_duration_of_about_1_5_seconds_at_the_real_capture_rate(self):
         """
         Pinned deliberately. Like the Mac Mini's consensus window, this is
-        a duration expressed in readings - it only means "2.5 seconds"
-        while CAPTURE_INTERVAL_WITHIN_BURST stays at 0.25s, so the two
-        have to be retuned together.
+        a duration expressed in readings - the count only means "1.5
+        seconds" at a particular CAPTURE_INTERVAL_WITHIN_BURST, so the two
+        have to be retuned together. Asserting the product rather than
+        just the two numbers is the point: it is the seconds that were
+        chosen, and the count is only how they get expressed.
         """
-        assert agent.CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT == 10
-        assert agent.CAPTURE_INTERVAL_WITHIN_BURST == 0.25
         seconds_before_early_exit = (
             agent.CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT * agent.CAPTURE_INTERVAL_WITHIN_BURST
         )
-        assert seconds_before_early_exit == 2.5
+        assert round(seconds_before_early_exit, 3) == 1.5
+
+    def test_the_consensus_window_on_the_mac_mini_covers_about_a_second_at_this_rate(self):
+        """
+        The pairing that spans two machines and two repos, which is exactly
+        why it is worth pinning from the side that can actually change it.
+        credit_ocr._READING_HISTORY_SIZE is 10 readings; at this file's
+        capture rate that is ~1 second of history, which is the duration
+        that was actually chosen. Raising the rate here without raising it
+        there silently shortens how far back the consensus reaches.
+        """
+        mac_mini_reading_history_size = 10  # credit_ocr._READING_HISTORY_SIZE
+        seconds_of_history = mac_mini_reading_history_size * agent.CAPTURE_INTERVAL_WITHIN_BURST
+        assert round(seconds_of_history, 3) == 1.0
+
+    def test_the_idle_check_is_short_enough_not_to_eat_the_start_of_a_short_buy_phase(self):
+        """
+        Fix #9's first cause. This interval is dead time between pressing B
+        and the first screenshot, and at 0.5s it was longer than the gap
+        between two captures by a factor of five - most of a fast look
+        could be spent not looking. It should cost no more than one
+        capture's worth of delay.
+        """
+        assert agent.IDLE_CHECK_INTERVAL <= agent.CAPTURE_INTERVAL_WITHIN_BURST
 
 
 class TestResetHistory:
