@@ -373,7 +373,102 @@ class TestTheReportedRoundEndToEnd:
         assert timer.consume_fresh_start() is True   # now, and only now, reset
 
 
+class TestEscStopsCapturingWithoutDiscardingTheQueue:
+    """
+    Fix #11. Esc is the one close this process can observe, and it has to
+    end the burst without throwing away the frames already queued - those
+    were all captured while the menu was still open, and the last of them
+    is typically the reading the final purchase produced.
+    """
+
+    def test_esc_stops_new_captures(self):
+        clock = FakeClock()
+        timer = BurstTimer(duration_seconds=20, clock=clock)
+        timer.trigger()
+        clock.advance(2)
+        assert timer.is_active() is True
+        timer.stop_capturing()
+        assert timer.is_active() is False
+
+    def test_esc_leaves_already_queued_frames_worth_sending(self):
+        """
+        The whole difference between this and force_end(), and the exact
+        reading the reported log would otherwise have lost.
+        """
+        clock = FakeClock()
+        timer = BurstTimer(duration_seconds=20, clock=clock)
+        timer.trigger()
+        clock.advance(2)
+        timer.stop_capturing()
+        assert timer.is_current(1) is True
+
+    def test_force_end_by_contrast_drops_them(self):
+        clock = FakeClock()
+        timer = BurstTimer(duration_seconds=20, clock=clock)
+        timer.trigger()
+        clock.advance(2)
+        timer.force_end()
+        assert timer.is_current(1) is False
+
+    def test_esc_reports_whether_a_burst_was_actually_running(self):
+        """
+        Esc opens Valorant's own menu when the buy menu is not up, which is
+        most of a round. The agent stays quiet about those.
+        """
+        clock = FakeClock()
+        timer = BurstTimer(duration_seconds=20, clock=clock)
+        assert timer.stop_capturing() is False
+        timer.trigger()
+        assert timer.stop_capturing() is True
+        assert timer.stop_capturing() is False
+
+    def test_a_press_after_esc_captures_again(self):
+        """
+        The re-open that fix #8 used to swallow, now reached by the route
+        that actually happens: close with Esc, press B again.
+        """
+        clock = FakeClock()
+        timer = BurstTimer(duration_seconds=20, clock=clock)
+        timer.trigger()
+        clock.advance(2)
+        timer.stop_capturing()
+        clock.advance(3)
+        assert timer.trigger() is False  # same buy phase, readings kept
+        assert timer.is_active() is True
+        assert timer.is_current(2) is True
+
+    def test_a_straggler_from_before_esc_is_dropped_once_the_menu_is_reopened(self):
+        """
+        The queue is left valid, not valid forever. A frame from the look
+        BEFORE this one holds a pre-purchase value, and the consensus on
+        the Mac Mini reports the newest reading it holds, so it must not
+        arrive late.
+        """
+        clock = FakeClock()
+        timer = BurstTimer(duration_seconds=20, clock=clock)
+        timer.trigger()
+        timer.stop_capturing()
+        clock.advance(3)
+        timer.trigger()
+        assert timer.is_current(1) is False
+        assert timer.is_current(2) is True
+
+    def test_the_queue_stops_being_valid_when_the_window_would_have_expired(self):
+        clock = FakeClock()
+        timer = BurstTimer(duration_seconds=20, clock=clock)
+        timer.trigger()
+        timer.stop_capturing()
+        clock.advance(20)
+        assert timer.is_current(1) is False
+
+
 class TestForceEndIsTheOnlyEarlyStop:
+    """
+    Named for fix #10, when it was. Since fix #11 Esc ends a burst too -
+    the two closes left to this are a B-toggle close and the round
+    starting, neither of which this process can see.
+    """
+
     def test_force_end_makes_the_timer_immediately_inactive(self):
         clock = FakeClock()
         timer = BurstTimer(duration_seconds=20, clock=clock)
@@ -387,7 +482,8 @@ class TestForceEndIsTheOnlyEarlyStop:
         The deliberate asymmetry, and the reason force_end takes no
         arguments. It only fires after a long run of frames that read as
         nothing, so everything queued behind it was captured after the menu
-        was already gone - known garbage, not a last good reading.
+        was already gone - known garbage, not a last good reading. Contrast
+        stop_capturing() above, where the opposite is true (fix #11).
         """
         clock = FakeClock()
         timer = BurstTimer(duration_seconds=20, clock=clock)

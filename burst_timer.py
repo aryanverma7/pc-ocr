@@ -51,8 +51,31 @@ two happened.
 
 Within one buy phase the newest reading is the one that counts - you
 have spent (or refunded) since the earlier ones - which the Mac Mini's
-consensus now reflects directly; see credit_ocr.py's finding #7 on the
-other machine.
+consensus now reflects directly; see credit_ocr.py's findings #7 and #8
+on the other machine.
+
+Real-world fix #11, from the same log that produced finding #8 there:
+after the menu was closed the agent went on capturing for another
+fifteen frames before the run of unreadable ones convinced it. Fix #10
+accepted that as the price of not knowing how the menu was closed, and
+for two of the three ways it is closed that is still true. But one of
+them IS a keystroke, and this process simply was not listening for it.
+
+Esc is now hooked alongside B and calls stop_capturing(). That answers
+the question fix #10 could not - the menu is definitely gone - for the
+common case, leaving the run of unreadable frames to cover only the two
+cases with no keystroke at all: a B-toggle close, and the round starting
+while the menu is still open.
+
+stop_capturing() is deliberately NOT force_end(). The two differ over
+work already sitting in the thread pool's queue, and that difference is
+the whole reason this is a separate method. Everything queued when
+force_end() fires was captured AFTER the menu closed, because that is
+what the run of unreadable frames means, so it is discarded. Everything
+queued when Esc arrives was captured BEFORE the menu closed - including,
+in the log that prompted this, the single frame holding the value the
+purchase had just produced - so it must still be sent. Discarding it
+would throw away exactly the reading finding #8 exists to preserve.
 """
 
 # Two presses closer together than this belong to the same buy phase, so
@@ -83,7 +106,13 @@ class BurstTimer:
         self.duration_seconds = duration_seconds
         self.new_round_gap_seconds = new_round_gap_seconds
         self._clock = clock or _time_module.time
+        # Two windows, not one, because "should a new frame be grabbed"
+        # and "is a frame that was already grabbed still worth sending"
+        # stop being the same question the moment Esc is hooked (fix #11).
+        # They move together everywhere except stop_capturing(), which
+        # closes the first and leaves the second open so the queue drains.
         self._active_until: float = 0.0
+        self._valid_until: float = 0.0
         # None rather than 0.0, so "no press has ever happened" is a state
         # of its own rather than "a press infinitely long ago" - the first
         # press must begin a new buy phase, and reading that off a
@@ -123,6 +152,7 @@ class BurstTimer:
         if is_new_phase:
             self._fresh_start_pending = True
         self._active_until = now + self.duration_seconds
+        self._valid_until = self._active_until
         return is_new_phase
 
     def consume_fresh_start(self) -> bool:
@@ -137,12 +167,39 @@ class BurstTimer:
     def is_current(self, generation: int) -> bool:
         """
         Whether work captured in `generation` is still worth sending: the
-        burst it belongs to must be both the newest one AND still running.
-        Checked by the worker thread immediately before the network call,
-        which is what stops a drained queue from POSTing readings taken
-        after the buy menu closed.
+        burst it belongs to must be the newest one, and must not have been
+        invalidated by force_end() or simply expired. Checked by the worker
+        thread immediately before the network call, which is what stops a
+        drained queue from POSTing readings taken after the buy menu closed.
+
+        Note this reads _valid_until, not is_active(). After Esc
+        (stop_capturing(), fix #11) no new frames are grabbed but the ones
+        already queued were all taken while the menu was open, and the last
+        of them is the most valuable reading of the whole burst.
         """
-        return generation == self.generation and self.is_active()
+        return generation == self.generation and self._clock() < self._valid_until
+
+    def stop_capturing(self) -> bool:
+        """
+        Stops grabbing new frames, while leaving everything already queued
+        valid to send. Called when Esc is pressed - the one close this
+        process can actually observe (fix #11).
+
+        Returns whether a burst was in fact running, so the caller can stay
+        quiet about an Esc pressed for anything else. Esc opens Valorant's
+        own menu when the buy menu is not up, and outside a burst there is
+        nothing here for it to do.
+
+        No new work can enter the queue after this, since the capture loop
+        gates on is_active(), so the queue drains once and stays empty
+        until the next press. That is why no drain deadline is needed:
+        _valid_until is left where trigger() put it, and the next press
+        bumps the generation, which invalidates any straggler anyway.
+        """
+        if not self.is_active():
+            return False
+        self._active_until = self._clock()
+        return True
 
     def force_end(self) -> None:
         """
@@ -156,8 +213,12 @@ class BurstTimer:
         simply letting the window expire.
 
         Does NOT bump the generation: is_current() already stops matching
-        once the burst is no longer active, and leaving the counter alone
+        once the burst is no longer valid, and leaving the counter alone
         keeps "which burst is this" answering the same thing before and
         after.
+
+        Closes BOTH windows, which is the difference between this and
+        stop_capturing() - see fix #11.
         """
         self._active_until = self._clock()
+        self._valid_until = self._active_until

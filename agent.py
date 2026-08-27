@@ -16,9 +16,9 @@ actually take to shop (confirmed with your own play pattern - see
 region.py's default) - the "min next round" value changes live as you
 spend credits, and is only accurate right before you close the menu.
 Capturing throughout the buy phase, combined with the Mac Mini's
-minimum-value consensus (see credit_ocr.py - it takes the SMALLEST
-validated reading, since credits only ever go down as you spend), means
-the stored value naturally converges on your true final balance without
+consensus (see credit_ocr.py - it reports the most recent reading, since
+what you have left is whatever the last look at the menu said), means the
+stored value naturally converges on your true final balance without
 needing to remember to keep the menu open.
 
 Real-world fix #3: starting a burst tells the Mac Mini to clear its
@@ -115,8 +115,28 @@ below notices, which is the cheap half of the trade.
 
 The Mac Mini's consensus changed to match, since keeping both looks'
 readings is only useful if the newer one wins: it now reports the most
-recent corroborated reading rather than the smallest one in the window.
-See credit_ocr.py's finding #7 there.
+recent reading rather than the smallest one in the window. See
+credit_ocr.py's findings #7 and #8 there.
+
+Real-world fix #11, from a log of a fast buy: the reading that mattered
+arrived, the menu was closed a fraction of a second later, and the agent
+kept capturing for another fifteen frames before the run of "no number
+found" responses convinced it the menu was gone. Fix #10 treated that as
+the unavoidable price of not being able to see a close - but Esc IS a
+keystroke, and this process simply was not listening for it.
+
+Esc is hooked now, and ends the capture half of the burst on the spot.
+The run of unreadable frames stays exactly where it was, because it is
+still the only thing that notices the two closes with no keystroke at
+all: a B-toggle close, and the round starting while the menu is open.
+
+What Esc must NOT do is discard the frames already queued for sending.
+Those were all captured while the menu was still open, and the last of
+them typically holds the value the final purchase produced - the single
+most valuable reading of the whole burst. So Esc calls
+burst.stop_capturing(), which closes the capture window and leaves the
+queue valid, rather than force_end(), which is only correct when
+everything queued was captured after the menu had already gone.
 
 Requires calibrate.py to have been run at least once first, and
 agent_secret in agent_config.json to match the Mac Mini's own
@@ -166,13 +186,13 @@ IDLE_CHECK_INTERVAL = 0.05  # how often to check whether a burst just started, w
 # CAPTURE_INTERVAL_WITHIN_BURST without changing this silently changes how
 # long the agent waits before deciding the buy menu closed.
 #
-# Since fix #10 this is the ONLY way a close is ever noticed - Esc, the
-# round starting, and a B-toggle close all look identical from here, and
-# all three look like frames that stop reading. So it is doing more work
-# than it was, and the 1.5 seconds is a balance between two costs: too
-# short and a run of frames caught on the menu's fade-in ends a burst
-# while the menu is still open, too long and the burst spends its tail
-# POSTing gameplay content.
+# Fix #10 made this the only way a close was ever noticed; fix #11 hooked
+# Esc and took the common case back off it. What is left for it are the
+# two closes with no keystroke at all - a B-toggle close, and the round
+# starting while the menu is still open - so it fires rarely now, and the
+# 1.5 seconds remains a balance between two costs: too short and a run of
+# frames caught on the menu's fade-in ends a burst while the menu is still
+# open, too long and the burst spends its tail POSTing gameplay content.
 CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 15
 
 # Real-world fix #5: the 0.25s interval above was already "4 images/second"
@@ -373,6 +393,12 @@ def main():
     new_round_gap = config.get("new_round_gap_seconds", NEW_ROUND_GAP_SECONDS)
     burst = BurstTimer(duration_seconds=burst_duration, new_round_gap_seconds=new_round_gap)
 
+    failure_tracker = ConsecutiveFailureTracker(threshold=CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT)
+    # Guards failure_tracker + burst.force_end() below, since those get
+    # touched from whichever worker thread happens to finish a request and
+    # from the keyboard hook's own thread, not just the main loop (fix #5).
+    tracker_lock = threading.Lock()
+
     # Only a genuine down-transition counts as a press. Holding B makes the
     # OS emit a repeating stream of key-down events, and every one of them
     # would restart the burst and bump the generation, throwing away each
@@ -395,13 +421,43 @@ def main():
             print("New buy phase - capturing.")
         else:
             print(f"Buy menu opened again within {new_round_gap}s - same buy phase, keeping its readings.")
+        # Every press is a fresh look at the menu, so unreadable frames
+        # from before it say nothing about whether THIS look is still open.
+        # Without this a burst that was already most of the way to its
+        # early exit could end a frame or two after being re-opened.
+        with tracker_lock:
+            failure_tracker.reset()
 
     def on_b_up(_):
         nonlocal b_is_down
         b_is_down = False
 
+    # Esc, the close this process can actually see (fix #11). Hooked with
+    # the same down-transition pairing as B, and for the same reason: the
+    # OS repeats a held key, and each repeat would otherwise re-run this.
+    esc_is_down = False
+
+    def on_esc_down(_):
+        nonlocal esc_is_down
+        if esc_is_down:
+            return
+        esc_is_down = True
+        # stop_capturing() reports whether a burst was actually running, so
+        # an Esc pressed to open Valorant's own menu mid-round is silent
+        # rather than claiming to have closed a buy menu that was not open.
+        if burst.stop_capturing():
+            print("Esc - buy menu closed, ending this burst. Frames already captured are still being sent.")
+            with tracker_lock:
+                failure_tracker.reset()
+
+    def on_esc_up(_):
+        nonlocal esc_is_down
+        esc_is_down = False
+
     keyboard.on_press_key("b", on_b_down)
     keyboard.on_release_key("b", on_b_up)
+    keyboard.on_press_key("esc", on_esc_down)
+    keyboard.on_release_key("esc", on_esc_up)
 
     # Daemon thread: this only reports status, so a Ctrl+C should never
     # wait on it. The event is still set on the way out so a stop during
@@ -414,16 +470,12 @@ def main():
         daemon=True,
     ).start()
 
-    print(f"Watching for 'B' (buy menu) - capturing for up to {burst_duration}s each time it's pressed.")
+    print(f"Watching for 'B' (buy menu) - capturing for up to {burst_duration}s each time it's pressed, "
+          f"or until Esc closes it.")
     print(f"Sending to {config['backend_url']}")
     print("Press Ctrl+C to stop.")
 
     last_capture_at = 0.0
-    failure_tracker = ConsecutiveFailureTracker(threshold=CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT)
-    # Guards failure_tracker + burst.force_end() below, since those now get
-    # touched from whichever worker thread happens to finish a request, not
-    # just the main loop thread (fix #5).
-    tracker_lock = threading.Lock()
     executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS, thread_name_prefix="ocr-send")
 
     def send_in_background(cfg: dict, cropped, generation: int) -> None:
