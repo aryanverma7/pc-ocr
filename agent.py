@@ -62,6 +62,15 @@ clean one (see burst_timer.py's own fix #6 for why that reverses the
 earlier "a re-press is an extension" rule), which both resets the Mac
 Mini's history and invalidates the previous generation's queued work.
 
+Real-world fix #7: the Mac Mini could not tell whether this agent was
+running. Captures only travel during a burst - a couple of seconds per
+round, nothing between them - so their absence is the normal state for
+most of a match and says nothing about whether the process is alive. A
+separate heartbeat now goes out on its own timer, which is what the admin
+dashboard's OCR row reports, so "is the gaming PC ready" is answerable
+before a stream rather than after the first !roulette comes back with the
+full roster because no credits were ever read.
+
 Requires calibrate.py to have been run at least once first, and
 agent_secret in agent_config.json to match the Mac Mini's own
 ocr_agent_secret in config.json exactly - they're the same value on
@@ -104,6 +113,14 @@ CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 10
 # encode + POST + status handling - is handed off to a small bounded
 # thread pool so a slow backend response never delays the next screenshot.
 MAX_CONCURRENT_REQUESTS = 4  # in-flight requests before new ones queue behind them
+
+# Three of these fit inside the Mac Mini's own 45-second staleness window
+# (ocr_agent.HEARTBEAT_TIMEOUT_SECONDS), so a couple of dropped pings in a
+# row never make the dashboard claim this agent died. Those two constants
+# belong together: shortening this one without widening that one there
+# does nothing, lengthening it past a third of that window makes the
+# dashboard flap.
+HEARTBEAT_INTERVAL_SECONDS = 15
 
 
 class ConsecutiveFailureTracker:
@@ -181,14 +198,71 @@ def capture_and_send(config: dict, cropped=None) -> "int | None":
     return response.status_code
 
 
+def endpoint(config: dict, name: str) -> str:
+    """
+    A sibling of the configured backend_url. Only backend_url is
+    configured, so every other route is derived from it - one address to
+    get right in agent_config.json rather than three that can disagree.
+    """
+    return config["backend_url"].rsplit("/", 1)[0] + "/" + name
+
+
 def reset_history(config: dict) -> None:
     """Called once at the start of a genuinely new buy phase - clears the Mac Mini's reading history."""
-    reset_url = config["backend_url"].rsplit("/", 1)[0] + "/reset"
     try:
-        requests.post(reset_url, headers={"X-Agent-Secret": config["agent_secret"]}, timeout=10)
+        requests.post(endpoint(config, "reset"), headers={"X-Agent-Secret": config["agent_secret"]}, timeout=10)
         print("New buy phase - reset the Mac Mini's reading history.")
     except requests.exceptions.RequestException as e:
         print(f"Could not reach the backend to reset history: {e}")
+
+
+def send_heartbeat(config: dict) -> "int | None":
+    """
+    One liveness ping. Returns the status code, or None if the request
+    itself failed, so the caller can report a change of state.
+    """
+    try:
+        response = requests.post(
+            endpoint(config, "heartbeat"),
+            headers={"X-Agent-Secret": config["agent_secret"]},
+            timeout=10,
+        )
+    except requests.exceptions.RequestException:
+        return None
+    return response.status_code
+
+
+def heartbeat_loop(config: dict, stop_event, sender=send_heartbeat, sleep=time.sleep) -> None:
+    """
+    Pings until told to stop, printing only when the answer CHANGES.
+
+    That last part is the whole design of this function. At one ping every
+    15 seconds a line per attempt would be a few thousand lines across a
+    stream, burying the capture output that is actually worth reading -
+    while a silent loop would hide the one event that matters, which is the
+    link going down or coming back. So transitions print and steady states
+    do not.
+
+    The sender and sleep are injected so the transition logic can be tested
+    against a scripted sequence of responses rather than a real Mac Mini
+    and a real clock.
+    """
+    last_status = "unset"
+    while not stop_event.is_set():
+        status = sender(config)
+        if status != last_status:
+            if status == 200:
+                print("Heartbeat: the Mac Mini can see this agent.")
+            elif status == 401:
+                print("Heartbeat: 401 - agent_secret doesn't match the Mac Mini's ocr_agent_secret.")
+            elif status == 404:
+                print("Heartbeat: 404 - this Mac Mini backend predates the heartbeat route. Pull and restart it.")
+            elif status is None:
+                print("Heartbeat: can't reach the Mac Mini. Captures won't get through either.")
+            else:
+                print(f"Heartbeat: unexpected response {status}.")
+            last_status = status
+        sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
 def main():
@@ -230,6 +304,17 @@ def main():
 
     keyboard.on_press_key("b", on_b_down)
     keyboard.on_release_key("b", on_b_up)
+
+    # Daemon thread: this only reports status, so a Ctrl+C should never
+    # wait on it. The event is still set on the way out so a stop during
+    # the sleep is clean rather than abandoned mid-request.
+    heartbeat_stop = threading.Event()
+    threading.Thread(
+        target=heartbeat_loop,
+        args=(config, heartbeat_stop),
+        name="heartbeat",
+        daemon=True,
+    ).start()
 
     print(f"Watching for 'B' (buy menu) - capturing for up to {burst_duration}s each time it's pressed.")
     print(f"Sending to {config['backend_url']}")
@@ -284,6 +369,7 @@ def main():
                 time.sleep(IDLE_CHECK_INTERVAL)
     except KeyboardInterrupt:
         print("Stopping...")
+        heartbeat_stop.set()
         executor.shutdown(wait=False, cancel_futures=True)
 
 

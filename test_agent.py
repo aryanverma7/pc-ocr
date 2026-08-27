@@ -187,3 +187,103 @@ class TestResetHistory:
         mock_post.side_effect = requests.exceptions.ConnectionError("could not connect")
 
         agent.reset_history(make_config())  # must not raise
+
+
+class _StopAfter:
+    """
+    A stand-in for threading.Event that reports "stopped" after a fixed
+    number of checks, so heartbeat_loop's own while condition ends the
+    loop exactly the way a real stop does - rather than the test breaking
+    out of it some other way and proving less than it looks like it does.
+    """
+
+    def __init__(self, checks: int):
+        self._remaining = checks
+
+    def is_set(self) -> bool:
+        if self._remaining <= 0:
+            return True
+        self._remaining -= 1
+        return False
+
+
+class TestHeartbeat:
+    @patch("agent.requests.post")
+    def test_pings_the_heartbeat_endpoint_beside_the_configured_url(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=200)
+
+        agent.send_heartbeat(make_config())
+
+        assert mock_post.call_args.args[0] == "https://hub.dualbladex.org/api/ocr/heartbeat"
+        assert mock_post.call_args.kwargs["headers"]["X-Agent-Secret"] == "test-secret-123"
+
+    @patch("agent.requests.post")
+    def test_a_network_failure_comes_back_as_none_rather_than_raising(self, mock_post):
+        import requests
+        mock_post.side_effect = requests.exceptions.ConnectionError("no route to host")
+
+        assert agent.send_heartbeat(make_config()) is None
+
+    def test_prints_once_per_change_of_state_not_once_per_ping(self):
+        # Five identical answers must produce exactly one line. At one ping
+        # every 15 seconds, printing per attempt would bury the capture
+        # output that is actually worth reading during a stream.
+        printed = []
+        with patch("builtins.print", side_effect=lambda *a: printed.append(" ".join(str(x) for x in a))):
+            agent.heartbeat_loop(
+                make_config(),
+                _StopAfter(5),
+                sender=lambda cfg: 200,
+                sleep=lambda seconds: None,
+            )
+
+        assert len(printed) == 1
+        assert "can see this agent" in printed[0]
+
+    def test_prints_again_when_the_link_goes_down_and_when_it_returns(self):
+        answers = iter([200, 200, None, None, 200])
+        printed = []
+        with patch("builtins.print", side_effect=lambda *a: printed.append(" ".join(str(x) for x in a))):
+            agent.heartbeat_loop(
+                make_config(),
+                _StopAfter(5),
+                sender=lambda cfg: next(answers),
+                sleep=lambda seconds: None,
+            )
+
+        assert len(printed) == 3
+        assert "can't reach the Mac Mini" in printed[1]
+        assert "can see this agent" in printed[2]
+
+    def test_a_401_names_the_secret_mismatch_rather_than_a_generic_failure(self):
+        printed = []
+        with patch("builtins.print", side_effect=lambda *a: printed.append(" ".join(str(x) for x in a))):
+            agent.heartbeat_loop(
+                make_config(),
+                _StopAfter(1),
+                sender=lambda cfg: 401,
+                sleep=lambda seconds: None,
+            )
+
+        assert "agent_secret" in printed[0]
+
+    def test_a_404_points_at_an_out_of_date_backend(self):
+        # The specific case of pulling this agent before pulling the Mac
+        # Mini: the route simply doesn't exist there yet.
+        printed = []
+        with patch("builtins.print", side_effect=lambda *a: printed.append(" ".join(str(x) for x in a))):
+            agent.heartbeat_loop(
+                make_config(),
+                _StopAfter(1),
+                sender=lambda cfg: 404,
+                sleep=lambda seconds: None,
+            )
+
+        assert "predates the heartbeat route" in printed[0]
+
+    def test_the_interval_fits_three_times_inside_the_mac_minis_cutoff(self):
+        # Guards the pairing described beside the constant: the Mac Mini's
+        # ocr_agent.HEARTBEAT_TIMEOUT_SECONDS is 45, and this interval has
+        # to leave room for two dropped pings before the dashboard reports
+        # the agent dead.
+        assert agent.HEARTBEAT_INTERVAL_SECONDS * 3 <= 45
