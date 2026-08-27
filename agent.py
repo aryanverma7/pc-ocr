@@ -73,13 +73,14 @@ full roster because no credits were ever read.
 
 Real-world fix #8, reported from a live round: the agent printed real
 readings and the admin dashboard still said "No reading yet". B is a
-toggle - the key that opens Valorant's buy menu is the key that closes
-it - and fix #6's "every press is a fresh start" rule fired on the close
-just as hard as on the open. So finishing a buy phase reset the Mac
-Mini's reading history, throwing away the numbers that had just been
-read correctly, and started a fresh burst aimed at a menu that was no
-longer on screen. See burst_timer.py's own fix #8: a press during an
-active burst is now the close of that burst, not the start of another.
+toggle - the key that opens Valorant's buy menu is also a key that
+closes it - and fix #6's "every press is a fresh start" rule fired on
+the close just as hard as on the open. So finishing a buy phase reset
+the Mac Mini's reading history, throwing away the numbers that had just
+been read correctly, and started a fresh burst aimed at a menu that was
+no longer on screen. Fix #8 made a press during an active burst the
+close of that burst; fix #10 below replaces that with a rule that does
+not depend on guessing which one a press was.
 
 Real-world fix #9, the other half of the same report: closing the menu
 quickly sometimes produced no reading at all. Three separate causes, all
@@ -94,6 +95,28 @@ now 0.05s, the rate is 10/sec, and the Mac Mini runs OCR in a thread
 pool. The constants derived from the capture rate were retuned with it -
 see CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT below and credit_ocr.py's
 _READING_HISTORY_SIZE on the other machine.
+
+Real-world fix #10, from watching how the menu is actually driven: it is
+opened with B and closed with Esc, and when a purchase is made at the
+last moment it is not closed by hand at all - the round starting closes
+it. Only the first of those three is a keystroke this process can see.
+Fix #8's toggle rule therefore mistook a genuine re-open for a close
+whenever the previous close had been an Esc within the last second and a
+half, and swallowed the whole second look.
+
+Every press now simply starts or restarts capturing, and the decision
+fix #6 got wrong - whether to reset the Mac Mini's reading history - is
+taken from the clock instead of from the keystroke. Two presses less
+than burst_timer.NEW_ROUND_GAP_SECONDS apart are two looks at one buy
+phase and the history is kept; a longer gap means a round went by and
+the history is reset. A press that really was a B-toggle close costs
+about a second and a half of unreadable frames before the early exit
+below notices, which is the cheap half of the trade.
+
+The Mac Mini's consensus changed to match, since keeping both looks'
+readings is only useful if the newer one wins: it now reports the most
+recent corroborated reading rather than the smallest one in the window.
+See credit_ocr.py's finding #7 there.
 
 Requires calibrate.py to have been run at least once first, and
 agent_secret in agent_config.json to match the Mac Mini's own
@@ -114,7 +137,7 @@ import keyboard
 import requests
 from PIL import ImageGrab
 
-from burst_timer import BurstTimer
+from burst_timer import BurstTimer, NEW_ROUND_GAP_SECONDS
 from region import load_config, is_calibrated, crop_to_region
 
 CAPTURE_INTERVAL_WITHIN_BURST = 0.1  # 10 images/second
@@ -141,11 +164,15 @@ IDLE_CHECK_INTERVAL = 0.05  # how often to check whether a burst just started, w
 # 1.5 seconds at the 10/sec rate above - see fix #4. Keep these two
 # constants in step: this is a duration expressed in readings, so changing
 # CAPTURE_INTERVAL_WITHIN_BURST without changing this silently changes how
-# long the agent waits before deciding the buy menu closed. Tightened from
-# 2.5s along with the rate change, because a B-press close now ends the
-# burst outright (fix #8) and this threshold only has to cover the case
-# where the menu was closed some other way - the shorter it is, the
-# smaller the window in which a genuine re-open gets mistaken for a close.
+# long the agent waits before deciding the buy menu closed.
+#
+# Since fix #10 this is the ONLY way a close is ever noticed - Esc, the
+# round starting, and a B-toggle close all look identical from here, and
+# all three look like frames that stop reading. So it is doing more work
+# than it was, and the 1.5 seconds is a balance between two costs: too
+# short and a run of frames caught on the menu's fade-in ends a burst
+# while the menu is still open, too long and the burst spends its tail
+# POSTing gameplay content.
 CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 15
 
 # Real-world fix #5: the 0.25s interval above was already "4 images/second"
@@ -261,7 +288,16 @@ def endpoint(config: dict, name: str) -> str:
 
 
 def reset_history(config: dict) -> None:
-    """Called once at the start of a genuinely new buy phase - clears the Mac Mini's reading history."""
+    """
+    Called once at the start of a genuinely new buy phase - clears the Mac
+    Mini's reading history so the previous round's numbers can't be
+    mistaken for this round's budget.
+
+    Deliberately NOT called for a second look at the same buy phase (fix
+    #10): re-opening the menu after buying is exactly when the first
+    look's readings become stale rather than wrong, and the Mac Mini's
+    consensus already prefers the newest reading it holds.
+    """
     try:
         requests.post(endpoint(config, "reset"), headers={"X-Agent-Secret": config["agent_secret"]}, timeout=10)
         print("New buy phase - reset the Mac Mini's reading history.")
@@ -334,14 +370,15 @@ def main():
     # capture_interval_seconds, used for a different, now-removed timer
     # design) would otherwise crash here with a KeyError.
     burst_duration = config.get("burst_duration_seconds", 30)
-    burst = BurstTimer(duration_seconds=burst_duration)
+    new_round_gap = config.get("new_round_gap_seconds", NEW_ROUND_GAP_SECONDS)
+    burst = BurstTimer(duration_seconds=burst_duration, new_round_gap_seconds=new_round_gap)
 
     # Only a genuine down-transition counts as a press. Holding B makes the
-    # OS emit a repeating stream of key-down events, and a trigger is now a
-    # toggle (fix #8) - so letting auto-repeat through would open and close
-    # the same burst dozens of times a second and never accumulate a single
-    # reading. Tracking the release is exact, where a timing-based debounce
-    # would only be a guess.
+    # OS emit a repeating stream of key-down events, and every one of them
+    # would restart the burst and bump the generation, throwing away each
+    # tick's captures a fraction of a second after taking them. Tracking
+    # the release is exact, where a timing-based debounce would only be a
+    # guess.
     b_is_down = False
 
     def on_b_down(_):
@@ -349,13 +386,15 @@ def main():
         if b_is_down:
             return
         b_is_down = True
+        # Both branches print. Which one fired is the single most useful
+        # thing in this log when a round reads wrong: it says whether the
+        # agent believed this was a new round or another look at the one
+        # already in progress, which is exactly the judgement fix #10 moved
+        # onto the clock.
         if burst.trigger():
-            print("Buy menu opened - capturing.")
+            print("New buy phase - capturing.")
         else:
-            # Not a silent event: this is the press that used to destroy the
-            # readings it had just taken, so it is worth being able to see it
-            # happen in the log next to the numbers it now preserves.
-            print("Buy menu closed - keeping this phase's readings.")
+            print(f"Buy menu opened again within {new_round_gap}s - same buy phase, keeping its readings.")
 
     def on_b_up(_):
         nonlocal b_is_down

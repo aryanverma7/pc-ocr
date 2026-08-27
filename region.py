@@ -63,11 +63,17 @@ def default_config() -> dict:
         # first few seconds of one. It was 6, which is shorter than the
         # shopping itself: the burst expired while the menu was still open,
         # so the final "min next round" - the only reading that is actually
-        # true - was never captured. Nothing depends on this being tight
-        # any more, because a burst now ends the moment the menu closes,
-        # either from the B press that closed it (burst_timer.py's fix #8)
-        # or from the run of unreadable frames that follows an Esc.
+        # true - was never captured. Nothing depends on this being tight,
+        # because the run of unreadable frames that follows a close ends
+        # the burst about a second and a half later however the menu was
+        # closed - Esc, a second B press, or the round simply starting.
         "burst_duration_seconds": 30,
+        # How far apart two B presses have to be before the second one is
+        # treated as a new round rather than a second look at the same buy
+        # phase. See burst_timer.NEW_ROUND_GAP_SECONDS, which this
+        # overrides and whose comment explains the choice; the Mac Mini
+        # holds the same number as credit_ocr._READING_MAX_AGE_SECONDS.
+        "new_round_gap_seconds": 20,
         "region": None,
     }
 

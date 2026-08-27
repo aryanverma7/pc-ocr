@@ -6,116 +6,127 @@ current one, when to reset the Mac Mini's history) can be genuinely
 tested with an injectable fake clock, while a real global keyboard hook
 can't be tested without an actual OS-level listener running.
 
-Real-world fix #6, and a reversal of an earlier decision: pressing B
-again now CANCELS the burst in progress and starts a clean new one,
-rather than extending the old one. The original rule - a re-press while
-still active is an "extension", not a fresh start, so it does NOT reset
-the Mac Mini's reading history - was aimed at re-opening the SAME buy
-menu mid-look. In practice the common case is the other one: buy, close
-the menu, then open it again. Extending meant the pre-purchase readings
-from the first look stayed in the consensus window alongside the
-post-purchase ones, and since the consensus takes the MINIMUM, a
-higher stale reading is harmless but a lower one is not - and the whole
-point of the second look is that it is the more recent, more correct
-one. Resetting on every press loses nothing: credits only ever go DOWN
-within a buy phase, so the newest burst's readings are always the ones
-worth keeping.
+The generation counter exists because capture work is handed to a thread
+pool (see agent.py's fix #5), and that pool's queue is unbounded - so
+when a burst ends, screenshots captured before it ended are still
+sitting in the queue waiting to be sent. Stamping each one with the
+generation it was captured in lets the worker drop stale work instead of
+POSTing readings from a menu that is already closed.
 
-The generation counter exists for the same fix. Capture work is handed
-to a thread pool (see agent.py's fix #5), and that pool's queue is
-unbounded - so when a burst ends, whether by early exit or by being
-cancelled, screenshots captured before it ended are still sitting in the
-queue waiting to be sent. Stamping each one with the generation it was
-captured in lets the worker drop stale work instead of POSTing readings
-from a menu that is already closed.
+Real-world fix #10, and the one that finally matches how the buy menu is
+actually driven. Two earlier rules were both wrong, in opposite
+directions, and both for the same underlying reason: the agent sees only
+the B key, and B is not the only way the menu opens and closes.
 
-Real-world fix #8, and the thing fix #6 got wrong: in Valorant, B is a
-TOGGLE. The same key that opens the buy menu is the key most people
-close it with. Fix #6's "every press is a fresh start" rule therefore
-fired on the close as well as the open - so the press that ended a buy
-phase wiped the Mac Mini's reading history and started a fresh burst
-pointed at a menu that was already gone. The readings from the look you
-just took were destroyed by the act of finishing it, the new burst read
-nothing but gameplay, and the dashboard showed "No reading yet" for a
-buy phase that had in fact been read perfectly. Reported exactly that
-way: the agent printed real numbers and the panel stayed empty.
+  Fix #6 said every press is a fresh start - open a new burst, reset the
+  Mac Mini's history. That fired on the press that CLOSED the menu too,
+  destroying the readings the buy phase had just produced.
 
-trigger() now models the toggle it actually is. A press while no burst
-is running is an OPEN: new generation, history reset, full window. A
-press while one IS running is a CLOSE: the burst ends and the readings
-stand. The return value says which happened so the caller doesn't have
-to re-derive it.
+  Fix #8 said B is a toggle, so a press during an active burst is the
+  close of that burst. That is true of B in isolation, but the menu is
+  closed with Esc at least as often, and the round starting closes it
+  with no keystroke at all. Neither of those is visible here. So after an
+  Esc, a press meant to RE-OPEN the menu landed while the burst was still
+  nominally running and got treated as a close - the re-open was never
+  captured at all. Reported exactly that way: closing the buy phase
+  quickly and re-opening it sometimes produced no reading.
 
-A close cannot simply drop everything in flight, though, the way an
-early exit can. An early exit only fires after a long run of unreadable
-frames, so what it discards is known garbage; a close discards the
-frames taken in the final moments before the menu shut, which are the
-single most valuable ones in the burst - "min next round" is at its
-truest right before you stop shopping. So ending on a close keeps a
-short send-grace during which already-captured work may still be POSTed
-even though capturing itself has stopped. The two questions "should the
-loop capture right now" and "is this queued frame still worth sending"
-were the same question before this; they are not.
+The rule now is the one that survives not knowing how the menu was
+closed: **every press means "look at the menu now"**. Capturing starts
+or restarts, unconditionally. If the press really was a B-toggle close,
+the menu is gone, the next frames are unreadable, and the run of 422s
+ends the burst early about a second and a half later - a small, bounded
+cost. If the press was a genuine re-open, it is captured, which is the
+case that was silently failing before.
+
+That leaves the question fix #6 got wrong to be answered separately, and
+it is now answered by the clock rather than by the keystroke. Resetting
+the Mac Mini's reading history is only correct across a ROUND boundary;
+re-opening the menu twice inside one buy phase must keep what the first
+look read. A Valorant round essentially never completes in under twenty
+seconds, so two presses closer together than that belong to the same buy
+phase, and only a press that follows a gap of at least
+NEW_ROUND_GAP_SECONDS begins a new one. trigger() returns which of the
+two happened.
+
+Within one buy phase the newest reading is the one that counts - you
+have spent (or refunded) since the earlier ones - which the Mac Mini's
+consensus now reflects directly; see credit_ocr.py's finding #7 on the
+other machine.
 """
 
-# How long queued captures stay sendable after the buy menu is closed with
-# a B press. Long enough to cover the pool's backlog at the real capture
-# rate, short enough that nothing captured after the menu shut can slip in
-# - the frames it lets through were all grabbed BEFORE the close.
-SEND_GRACE_SECONDS = 0.75
+# Two presses closer together than this belong to the same buy phase, so
+# the second must not wipe what the first read; a longer gap means a
+# round went by in between and the old readings are a different round's
+# budget. Twenty seconds is chosen against Valorant's own pacing: a round
+# that has to be won, ended and followed by a fresh buy phase does not fit
+# into it, while a shop-close-reshop inside one buy phase easily does.
+#
+# The Mac Mini enforces the same number from its own side as
+# credit_ocr._READING_MAX_AGE_SECONDS, so a reset POST that never arrives
+# (a network blip, an agent restart) cannot leave a previous round's
+# readings standing forever. Change one and change the other.
+NEW_ROUND_GAP_SECONDS = 20
+
 import time as _time_module
 
 
 class BurstTimer:
     """
     Tracks whether we're currently within a capture burst window.
-    Pressing the trigger key starts (or extends) the window; the capture
+    Pressing the trigger key starts (or restarts) the window; the capture
     loop checks is_active() on each tick to decide whether to actually
     capture right now.
     """
 
-    def __init__(self, duration_seconds: float, clock=None):
+    def __init__(self, duration_seconds: float, clock=None, new_round_gap_seconds: float = NEW_ROUND_GAP_SECONDS):
         self.duration_seconds = duration_seconds
+        self.new_round_gap_seconds = new_round_gap_seconds
         self._clock = clock or _time_module.time
         self._active_until: float = 0.0
-        # Separate from _active_until on purpose (fix #8): capturing stops
-        # the instant the menu closes, but frames already grabbed stay
-        # worth sending for a moment longer.
-        self._send_until: float = 0.0
+        # None rather than 0.0, so "no press has ever happened" is a state
+        # of its own rather than "a press infinitely long ago" - the first
+        # press must begin a new buy phase, and reading that off a
+        # sentinel timestamp would depend on where the injected clock
+        # happens to start.
+        self._last_press_at: "float | None" = None
         self._fresh_start_pending = False
         # Bumped by every trigger, so in-flight work from a burst that has
-        # since been cancelled or ended can be identified and dropped. Starts
-        # at 0, which no capture is ever stamped with - the first trigger
-        # makes it 1 - so a stale 0 can never be mistaken for a live burst.
+        # since been superseded can be identified and dropped. Starts at 0,
+        # which no capture is ever stamped with - the first trigger makes
+        # it 1 - so a stale 0 can never be mistaken for a live burst.
         self.generation = 0
 
     def trigger(self) -> bool:
         """
-        Called when B is pressed. Returns True if this press OPENED the buy
-        menu and started a burst, False if it CLOSED one that was already
-        running.
+        Called when B is pressed. Always starts or restarts capturing (see
+        fix #10 above - a press can be an open or a close and this cannot
+        tell, so it assumes the one whose cost when wrong is a second of
+        unreadable frames rather than a whole missed buy look).
 
-        B is a toggle in game and is a toggle here (fix #8 above). Pressing
-        it with no burst running is an open: a new generation, a fresh
-        start flag so the Mac Mini's history gets reset, and the full
-        window. Pressing it with a burst running is the close of that same
-        look - the burst ends, the history is left exactly as it is, and
-        no new burst begins.
+        Returns True if this press begins a NEW buy phase, meaning the Mac
+        Mini's reading history should be reset, and False if it continues
+        the buy phase already in progress, meaning the earlier readings
+        must be kept.
+
+        The generation is bumped either way. Frames captured before this
+        press are from an older look at the menu, and the consensus on the
+        other machine reports the most recent reading it holds, so letting
+        a straggler arrive after this press could report a value from
+        before the purchase that prompted the re-open.
         """
-        if self.is_active():
-            self.force_end(send_grace_seconds=SEND_GRACE_SECONDS)
-            return False
+        now = self._clock()
+        is_new_phase = self._last_press_at is None or (now - self._last_press_at) >= self.new_round_gap_seconds
 
+        self._last_press_at = now
         self.generation += 1
-        self._fresh_start_pending = True
-        self._active_until = self._clock() + self.duration_seconds
-        # Cleared rather than left over from a previous close, so a grace
-        # granted to an older burst can never outlive this one.
-        self._send_until = 0.0
-        return True
+        if is_new_phase:
+            self._fresh_start_pending = True
+        self._active_until = now + self.duration_seconds
+        return is_new_phase
 
     def consume_fresh_start(self) -> bool:
-        """Returns whether a trigger() has happened since this was last called, and clears the flag - a "read once" pattern so the history reset fires once per press, not once per capture tick."""
+        """Returns whether a trigger() that began a new buy phase has happened since this was last called, and clears the flag - a "read once" pattern so the history reset fires once per press, not once per capture tick."""
         was_fresh = self._fresh_start_pending
         self._fresh_start_pending = False
         return was_fresh
@@ -131,24 +142,22 @@ class BurstTimer:
         which is what stops a drained queue from POSTing readings taken
         after the buy menu closed.
         """
-        return generation == self.generation and self._clock() < max(self._active_until, self._send_until)
+        return generation == self.generation and self.is_active()
 
-    def force_end(self, send_grace_seconds: float = 0.0) -> None:
+    def force_end(self) -> None:
         """
         Ends the burst immediately, regardless of the configured duration.
 
-        Two callers with genuinely different needs. The early exit on
-        consecutive failures passes no grace: it only fires after a long
-        run of unreadable frames, so everything still queued behind it was
-        captured after the menu was already gone. A close by B press passes
-        SEND_GRACE_SECONDS, because what is queued there was captured
-        while the menu was open and holds the most accurate reading of the
-        whole burst.
+        One caller: the run of consecutive unreadable frames that means
+        the menu closed without a keystroke this process could see - an
+        Esc, or the round simply starting. Everything still queued when it
+        fires was captured after the menu was already gone, so nothing is
+        given a chance to drain; that is the difference between this and
+        simply letting the window expire.
 
         Does NOT bump the generation: is_current() already stops matching
-        once both deadlines pass, and leaving the counter alone keeps
-        "which burst is this" answering the same thing before and after.
+        once the burst is no longer active, and leaving the counter alone
+        keeps "which burst is this" answering the same thing before and
+        after.
         """
-        now = self._clock()
-        self._active_until = now
-        self._send_until = now + send_grace_seconds
+        self._active_until = self._clock()

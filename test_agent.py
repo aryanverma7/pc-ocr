@@ -186,6 +186,28 @@ class TestConsecutiveFailureTracker:
         """
         assert agent.IDLE_CHECK_INTERVAL <= agent.CAPTURE_INTERVAL_WITHIN_BURST
 
+    def test_the_new_round_gap_matches_what_the_mac_mini_enforces(self):
+        """
+        The second pairing that spans both repos. This agent decides when
+        to reset the reading history; the Mac Mini independently discards a
+        window older than credit_ocr._READING_MAX_AGE_SECONDS, so that a
+        reset which never arrives cannot leave a previous round's budget
+        deciding what viewers may vote for. They are the same fact and have
+        to be the same number - if this one were longer, the Mac Mini would
+        blank a window the agent still considers live.
+        """
+        mac_mini_reading_max_age_seconds = 20  # credit_ocr._READING_MAX_AGE_SECONDS
+        assert agent.NEW_ROUND_GAP_SECONDS == mac_mini_reading_max_age_seconds
+
+    def test_a_new_round_gap_comfortably_outlasts_a_whole_burst_of_captures(self):
+        """
+        Sanity on the two timers not fighting: a burst can run for its full
+        duration and the gap is measured from the press that started it, so
+        a gap shorter than a burst would classify the natural end of one
+        buy phase as the start of the next.
+        """
+        assert agent.NEW_ROUND_GAP_SECONDS >= agent.CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT * agent.CAPTURE_INTERVAL_WITHIN_BURST
+
 
 class TestResetHistory:
     @patch("agent.requests.post")
