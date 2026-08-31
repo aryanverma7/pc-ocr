@@ -1,0 +1,43 @@
+{
+  "manifest_version": 1,
+  "type": "WebApp",
+  "meta": {
+    "name": "DualBladeX Game Events",
+    "version": "1.0.0",
+    "minimum-overwolf-version": "0.200.0",
+    "author": "DualBladeX",
+    "icon": "icons/icon.png",
+    "icon_gray": "icons/icon_gray.png",
+    "description": "Reports live Valorant round state to the DualBladeX stream backend."
+  },
+  "permissions": ["GameInfo"],
+  "data": {
+    "start_window": "background",
+    "windows": {
+      "background": {
+        "file": "background.html",
+        "is_background_page": true
+      },
+      "status": {
+        "file": "status.html",
+        "desktop_only": true,
+        "resizable": true,
+        "transparent": false,
+        "size": { "width": 560, "height": 520 },
+        "min_size": { "width": 420, "height": 320 }
+      }
+    },
+    "game_targeting": {
+      "type": "dedicated",
+      "game_ids": [21640]
+    },
+    "game_events": [21640],
+    "launch_events": [
+      {
+        "event": "GameLaunch",
+        "event_data": { "game_ids": [21640] },
+        "start_minimized": true
+      }
+    ]
+  }
+}

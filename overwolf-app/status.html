@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DualBladeX Game Events</title>
+  <style>
+    :root{
+      --ink:#0F1923; --panel:#151F2B; --accent:#34f5c5;
+      --paper:#ECE8E1; --paper-dim:#9AA3AC; --bad:#B8323F; --gold:#F2C879;
+    }
+    *{box-sizing:border-box;}
+    body{
+      margin:0; padding:14px; background:var(--ink); color:var(--paper);
+      font-family:'Segoe UI',system-ui,sans-serif; font-size:13px;
+      -webkit-user-select:none; user-select:none;
+    }
+    h1{font-size:13px; letter-spacing:.14em; text-transform:uppercase; color:var(--paper-dim); margin:0 0 12px;}
+    .row{display:flex; justify-content:space-between; gap:12px; padding:4px 0; border-bottom:1px solid rgba(154,163,172,.12);}
+    .row .k{color:var(--paper-dim);}
+    .row .v{font-variant-numeric:tabular-nums; text-align:right;}
+    .ok{color:var(--accent); font-weight:600;}
+    .bad{color:var(--bad); font-weight:600;}
+    .warn{color:var(--gold); font-weight:600;}
+    .card{background:var(--panel); border:1px solid rgba(52,245,197,.18); padding:10px 12px; margin-bottom:12px;}
+    #log{
+      background:#0B121A; border:1px solid rgba(154,163,172,.18); padding:8px;
+      height:190px; overflow:auto; font-family:Consolas,monospace; font-size:11px;
+      color:var(--paper-dim); white-space:pre-wrap; -webkit-user-select:text; user-select:text;
+    }
+  </style>
+</head>
+<body>
+  <h1>DualBladeX Game Events</h1>
+
+  <div class="card">
+    <div class="row"><span class="k">Game</span><span class="v" id="game">-</span></div>
+    <div class="row"><span class="k">GEP features</span><span class="v" id="features">-</span></div>
+    <div class="row"><span class="k">Backend</span><span class="v" id="backend">-</span></div>
+    <div class="row"><span class="k">Snapshots sent</span><span class="v" id="posts">0</span></div>
+  </div>
+
+  <div class="card">
+    <div class="row"><span class="k">Round phase</span><span class="v" id="phase">-</span></div>
+    <div class="row"><span class="k">Round</span><span class="v" id="round">-</span></div>
+    <div class="row"><span class="k">Score</span><span class="v" id="score">-</span></div>
+    <div class="row"><span class="k">Credits (money)</span><span class="v" id="money">-</span></div>
+    <div class="row"><span class="k">Agent</span><span class="v" id="agent">-</span></div>
+    <div class="row"><span class="k">Map / mode</span><span class="v" id="map">-</span></div>
+    <div class="row"><span class="k">Match outcome</span><span class="v" id="outcome">-</span></div>
+  </div>
+
+  <div id="log"></div>
+  <script src="status.js"></script>
+</body>
+</html>
