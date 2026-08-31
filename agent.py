@@ -138,6 +138,37 @@ burst.stop_capturing(), which closes the capture window and leaves the
 queue valid, rather than force_end(), which is only correct when
 everything queued was captured after the menu had already gone.
 
+Real-world fix #12, from end-to-end testing before going live: the value
+read was still not always the one on screen when the menu closed. The
+consensus rules are right; the frame they needed was sometimes never
+taken. Between a purchase landing and the menu closing there is a gap of
+a fraction of a second, and at ten captures a second that gap holds one
+or two frames - either of which can land on an animating price panel and
+come back unreadable.
+
+The rate is 20/sec now, which makes the same gap two to four frames. The
+part that is NOT just a bigger number is MAX_PENDING_CAPTURES: this
+process can grab frames far faster than a 2012 Mac Mini can OCR them, and
+the send pool's queue is unbounded, so asking for a rate the backend
+cannot retire converts the surplus into a growing backlog. Every frame in
+a backlog is delivered late, which is worse than never taking it - the
+reading from the end of the burst arrives after the roulette has already
+read the consensus. The loop therefore declines to grab a frame while
+MAX_PENDING_CAPTURES sends are already outstanding, so an over-ambitious
+rate degrades to the backend's real one rather than to lag.
+
+Real-world fix #13, from the same testing session: the Mac Mini was
+throwing away a perfectly good reading twenty seconds after the buy menu
+closed, so for most of every round the dashboard said it had no budget
+and the roulette opened its full roster. That twenty seconds existed only
+because a reset POST can go missing, and an age was the only way to
+notice. It is not any more: every capture and every reset now carries an
+X-Buy-Phase header holding the id of the buy phase it belongs to, bumped
+here when - and only when - burst.trigger() reports a genuinely new
+phase. The Mac Mini clears its window when that id changes, so a dropped
+reset costs nothing and a reading can safely live until the next time B
+is actually pressed. See credit_ocr.py's finding #9 there.
+
 Requires calibrate.py to have been run at least once first, and
 agent_secret in agent_config.json to match the Mac Mini's own
 ocr_agent_secret in config.json exactly - they're the same value on
@@ -160,28 +191,36 @@ from PIL import ImageGrab
 from burst_timer import BurstTimer, NEW_ROUND_GAP_SECONDS
 from region import load_config, is_calibrated, crop_to_region
 
-CAPTURE_INTERVAL_WITHIN_BURST = 0.1  # 10 images/second
+CAPTURE_INTERVAL_WITHIN_BURST = 0.05  # 20 images/second
 
-# Raised from 4/sec for fix #9. A buy menu that is opened and closed in a
-# couple of seconds used to yield about eight frames, and the first few of
-# those land on the menu's fade-in where the label isn't fully drawn yet -
-# so a fast look could genuinely produce nothing readable. Ten a second
-# makes the same two-second look about twenty frames.
+# Raised 4/sec to 10/sec for fix #9, and 10/sec to 20/sec for fix #12. A
+# buy menu that is opened and closed in a couple of seconds used to yield
+# about eight frames, and the first few of those land on the menu's
+# fade-in where the label isn't fully drawn yet - so a fast look could
+# genuinely produce nothing readable. Twenty a second makes the same
+# two-second look about forty frames.
 #
-# This rate is only honest because the Mac Mini stopped running Tesseract
-# on its event loop at the same time (credit_ocr.py's own fix). Asking for
-# a rate the backend can't retire doesn't raise the real one; it just
-# builds a queue here, and every frame in that queue is dropped at the end
-# of the burst anyway.
-IDLE_CHECK_INTERVAL = 0.05  # how often to check whether a burst just started, while idle
+# What the extra rate actually buys is the LAST frame, not more frames on
+# average. The reading that decides the roster is the one taken between a
+# purchase landing and the menu closing, and that gap is a fraction of a
+# second wide; halving the interval halves the chance of falling in it and
+# capturing nothing.
+#
+# This rate is only honest as far as the Mac Mini can retire it, and
+# asking for one it cannot does not raise the real rate - it builds a
+# queue here, and a queue delays exactly the tail frames that matter most.
+# MAX_PENDING_CAPTURES below is what stops that queue from growing, so
+# over-asking degrades to the backend's real rate instead of to lag.
+IDLE_CHECK_INTERVAL = 0.02  # how often to check whether a burst just started, while idle
 
-# Was 0.5s, which meant up to half a second of a short buy phase elapsed
-# between the keypress and the first screenshot - dead time at exactly the
-# moment that matters least to lose. This loop does nothing but read a
-# float and compare it, so checking ten times more often costs nothing
-# measurable next to the screenshots it gates.
+# Was 0.5s, then 0.05s for fix #9, now 0.02s. This is pure dead time
+# between the keypress and the first screenshot - the moment that matters
+# least to lose - so it belongs well under one capture interval, and at
+# 0.05s it had become a whole frame's worth at the rate above. This loop
+# does nothing but read a float and compare it, so checking more often
+# costs nothing measurable next to the screenshots it gates.
 
-# 1.5 seconds at the 10/sec rate above - see fix #4. Keep these two
+# 1.5 seconds at the 20/sec rate above - see fix #4. Keep these two
 # constants in step: this is a duration expressed in readings, so changing
 # CAPTURE_INTERVAL_WITHIN_BURST without changing this silently changes how
 # long the agent waits before deciding the buy menu closed.
@@ -193,7 +232,7 @@ IDLE_CHECK_INTERVAL = 0.05  # how often to check whether a burst just started, w
 # 1.5 seconds remains a balance between two costs: too short and a run of
 # frames caught on the menu's fade-in ends a burst while the menu is still
 # open, too long and the burst spends its tail POSTing gameplay content.
-CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 15
+CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 30
 
 # Real-world fix #5: the 0.25s interval above was already "4 images/second"
 # on paper, but the loop used to call capture_and_send() - screenshot AND
@@ -206,13 +245,33 @@ CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 15
 # loop's own precise 0.25s tick (see main() below), but the slow part -
 # encode + POST + status handling - is handed off to a small bounded
 # thread pool so a slow backend response never delays the next screenshot.
-MAX_CONCURRENT_REQUESTS = 8  # in-flight requests before new ones queue behind them
+MAX_CONCURRENT_REQUESTS = 16  # in-flight requests before new ones queue behind them
 
-# Doubled with the capture rate. This is the real ceiling on the achieved
-# rate: with four workers and a round trip near half a second, no more
-# than eight requests a second can ever be retired however often the loop
-# grabs a frame, so leaving it at four would have quietly capped fix #9's
-# 10/sec back down at the old number.
+# Doubled with the capture rate, twice. This is the real ceiling on the
+# achieved rate: with four workers and a round trip near half a second, no
+# more than eight requests a second can ever be retired however often the
+# loop grabs a frame, so leaving it at four would have quietly capped fix
+# #9's 10/sec back down at the old number, and leaving it at eight would
+# do the same to fix #12's 20/sec.
+
+# Real-world fix #12: the capture rate went to 20/sec because a fast buy
+# was still occasionally missing the frame that mattered. Rate alone is
+# not enough, though, because this pool's queue is UNBOUNDED - if the Mac
+# Mini cannot OCR 20 images a second (two Tesseract workers on a 2012
+# machine is genuinely close to that line), the excess does not vanish, it
+# accumulates. A backlog is worse than a lower rate: every frame in it is
+# delivered late, so the reading taken as the menu closes lands after the
+# roulette has already read the consensus, and a backlog deep enough to
+# outlive the burst is thrown away entirely by the generation check.
+#
+# So the loop declines to grab a frame while this many sends are already
+# outstanding. Over-asking then degrades to whatever rate the backend can
+# actually retire, which is the honest failure, instead of to lag.
+#
+# Sized at just over a second of captures. Small enough that a saturated
+# pipeline stays within a second of live; large enough that an ordinary
+# slow round trip never trips it.
+MAX_PENDING_CAPTURES = 24
 
 # Three of these fit inside the Mac Mini's own 45-second staleness window
 # (ocr_agent.HEARTBEAT_TIMEOUT_SECONDS), so a couple of dropped pings in a
@@ -250,7 +309,7 @@ class ConsecutiveFailureTracker:
         self._count = 0
 
 
-def capture_and_send(config: dict, cropped=None) -> "int | None":
+def capture_and_send(config: dict, cropped=None, buy_phase: "int | None" = None) -> "int | None":
     """
     Returns the response's HTTP status code, or None if the request itself
     failed (network error). Accepts an already-cropped image (see fix #5
@@ -258,6 +317,15 @@ def capture_and_send(config: dict, cropped=None) -> "int | None":
     rather than whenever a worker thread gets scheduled - callers that
     don't care about that precision (the existing tests included) can omit
     it and let this grab fresh, same as before.
+
+    `buy_phase` is the id of the buy phase this frame was taken in, sent
+    as X-Buy-Phase (fix #13). The Mac Mini clears its reading window when
+    that value changes, which makes the separate reset POST advisory
+    rather than load-bearing: a dropped reset used to leave the previous
+    round's budget standing until it aged out, and the age it was given
+    for that reason - twenty seconds - was also short enough to erase a
+    perfectly good reading in the middle of a live round. See
+    credit_ocr.py's finding #9 on the other machine.
 
     The CROP, not the full screenshot, is what gets handed over. A queued
     full-screen grab is around 6 MB of RGB at 1080p, so a backlog of a
@@ -271,11 +339,15 @@ def capture_and_send(config: dict, cropped=None) -> "int | None":
     buffer = io.BytesIO()
     cropped.save(buffer, format="PNG")
 
+    headers = {"X-Agent-Secret": config["agent_secret"]}
+    if buy_phase is not None:
+        headers["X-Buy-Phase"] = str(buy_phase)
+
     try:
         response = requests.post(
             config["backend_url"],
             data=buffer.getvalue(),
-            headers={"X-Agent-Secret": config["agent_secret"]},
+            headers=headers,
             timeout=10,
         )
     except requests.exceptions.RequestException as e:
@@ -307,7 +379,7 @@ def endpoint(config: dict, name: str) -> str:
     return config["backend_url"].rsplit("/", 1)[0] + "/" + name
 
 
-def reset_history(config: dict) -> None:
+def reset_history(config: dict, buy_phase: "int | None" = None) -> None:
     """
     Called once at the start of a genuinely new buy phase - clears the Mac
     Mini's reading history so the previous round's numbers can't be
@@ -317,9 +389,17 @@ def reset_history(config: dict) -> None:
     #10): re-opening the menu after buying is exactly when the first
     look's readings become stale rather than wrong, and the Mac Mini's
     consensus already prefers the newest reading it holds.
+
+    Carries the same X-Buy-Phase id the captures do, so the Mac Mini can
+    tell this reset apart from one it has already acted on - the first
+    capture of a new phase declares the phase too, and whichever of the
+    two arrives first is the one that does the clearing (fix #13).
     """
+    headers = {"X-Agent-Secret": config["agent_secret"]}
+    if buy_phase is not None:
+        headers["X-Buy-Phase"] = str(buy_phase)
     try:
-        requests.post(endpoint(config, "reset"), headers={"X-Agent-Secret": config["agent_secret"]}, timeout=10)
+        requests.post(endpoint(config, "reset"), headers=headers, timeout=10)
         print("New buy phase - reset the Mac Mini's reading history.")
     except requests.exceptions.RequestException as e:
         print(f"Could not reach the backend to reset history: {e}")
@@ -407,8 +487,17 @@ def main():
     # guess.
     b_is_down = False
 
+    # Which buy phase the frames being captured belong to (fix #13). Bumped
+    # only when burst.trigger() reports a genuinely new phase, so a second
+    # look at the same buy menu keeps the id - and therefore keeps the
+    # readings the first look produced, which is the whole point of fix
+    # #10. Monotonic within one run of this process; the Mac Mini only ever
+    # compares it for equality, never for order, so a restart that sends 1
+    # again reads correctly as "a different phase from the last one".
+    buy_phase_id = 0
+
     def on_b_down(_):
-        nonlocal b_is_down
+        nonlocal b_is_down, buy_phase_id
         if b_is_down:
             return
         b_is_down = True
@@ -418,6 +507,7 @@ def main():
         # already in progress, which is exactly the judgement fix #10 moved
         # onto the clock.
         if burst.trigger():
+            buy_phase_id += 1
             print("New buy phase - capturing.")
         else:
             print(f"Buy menu opened again within {new_round_gap}s - same buy phase, keeping its readings.")
@@ -478,23 +568,41 @@ def main():
     last_capture_at = 0.0
     executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS, thread_name_prefix="ocr-send")
 
-    def send_in_background(cfg: dict, cropped, generation: int) -> None:
-        # Checked HERE, in the worker, not at submit time - the whole point
-        # is that this work may have sat in the pool's unbounded queue while
-        # the burst it belongs to ended or was cancelled by a new B press.
-        # Sending it anyway is not just log noise: a frame captured after
-        # the menu closed can still OCR to a real number and land in the Mac
-        # Mini's consensus window.
-        if not burst.is_current(generation):
-            return
-        status = capture_and_send(cfg, cropped=cropped)
-        with tracker_lock:
-            failure_tracker.record_status(status)
-            if failure_tracker.should_early_exit():
-                print(f"{CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT} consecutive 'no number found' responses - "
-                      f"assuming the buy menu already closed, ending this burst early.")
-                burst.force_end()
-                failure_tracker.reset()
+    # How many captures are submitted but not yet finished - the depth of
+    # the backlog fix #12 exists to cap. Counted here rather than read off
+    # the executor, whose queue length is a private implementation detail
+    # and does not include the requests currently in flight anyway.
+    pending_captures = 0
+    pending_lock = threading.Lock()
+    # Whether the last tick declined to capture. Only transitions are
+    # printed: a saturated pipeline saturates for many ticks in a row, and
+    # a line per tick would bury the readings this log exists to show.
+    was_saturated = False
+
+    def send_in_background(cfg: dict, cropped, generation: int, phase: int) -> None:
+        nonlocal pending_captures
+        try:
+            # Checked HERE, in the worker, not at submit time - the whole
+            # point is that this work may have sat in the pool's unbounded
+            # queue while the burst it belongs to ended or was cancelled by
+            # a new B press. Sending it anyway is not just log noise: a
+            # frame captured after the menu closed can still OCR to a real
+            # number and land in the Mac Mini's consensus window.
+            if not burst.is_current(generation):
+                return
+            status = capture_and_send(cfg, cropped=cropped, buy_phase=phase)
+            with tracker_lock:
+                failure_tracker.record_status(status)
+                if failure_tracker.should_early_exit():
+                    print(f"{CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT} consecutive 'no number found' responses - "
+                          f"assuming the buy menu already closed, ending this burst early.")
+                    burst.force_end()
+                    failure_tracker.reset()
+        finally:
+            # In a finally, so a raising worker cannot leak a slot and
+            # slowly starve the loop of the right to capture at all.
+            with pending_lock:
+                pending_captures -= 1
 
     try:
         while True:
@@ -502,19 +610,41 @@ def main():
                 if burst.consume_fresh_start():
                     # A genuinely NEW buy phase, not just re-opening the
                     # same one - the real fix for cross-round contamination.
-                    reset_history(config)
+                    reset_history(config, buy_phase=buy_phase_id)
                     with tracker_lock:
                         failure_tracker.reset()
 
                 now = time.time()
                 if now - last_capture_at >= CAPTURE_INTERVAL_WITHIN_BURST:
                     last_capture_at = now
-                    # Grab happens right here, on-schedule, every tick -
-                    # never delayed by a busy worker or a slow backend.
-                    cropped = crop_to_region(ImageGrab.grab(), config["region"])
-                    executor.submit(send_in_background, config, cropped, burst.generation)
+                    with pending_lock:
+                        saturated = pending_captures >= MAX_PENDING_CAPTURES
+                        if not saturated:
+                            pending_captures += 1
+                    if saturated:
+                        # Deliberately skipped, not queued (fix #12). A
+                        # frame added to a full backlog arrives too late to
+                        # be the answer, and holds a screenshot in memory
+                        # until it does.
+                        if not was_saturated:
+                            print(f"Backend is behind - {MAX_PENDING_CAPTURES} captures still in flight, so this "
+                                  f"tick is being skipped rather than queued. Capture rate is now whatever the "
+                                  f"Mac Mini can keep up with.")
+                            was_saturated = True
+                    else:
+                        if was_saturated:
+                            print("Backend caught up - capturing at the full rate again.")
+                            was_saturated = False
+                        # Grab happens right here, on-schedule, every tick -
+                        # never delayed by a busy worker or a slow backend.
+                        cropped = crop_to_region(ImageGrab.grab(), config["region"])
+                        executor.submit(send_in_background, config, cropped, burst.generation, buy_phase_id)
 
-                time.sleep(0.05)
+                # Well under one capture interval, so the tick above lands
+                # on time rather than one sleep late - at the old 0.05s this
+                # sleep WAS the interval, which would have quietly capped
+                # the real rate below the nominal one.
+                time.sleep(0.01)
             else:
                 time.sleep(IDLE_CHECK_INTERVAL)
     except KeyboardInterrupt:

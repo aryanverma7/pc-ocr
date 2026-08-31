@@ -167,12 +167,12 @@ class TestConsecutiveFailureTracker:
         """
         The pairing that spans two machines and two repos, which is exactly
         why it is worth pinning from the side that can actually change it.
-        credit_ocr._READING_HISTORY_SIZE is 10 readings; at this file's
+        credit_ocr._READING_HISTORY_SIZE is 20 readings; at this file's
         capture rate that is ~1 second of history, which is the duration
         that was actually chosen. Raising the rate here without raising it
         there silently shortens how far back the consensus reaches.
         """
-        mac_mini_reading_history_size = 10  # credit_ocr._READING_HISTORY_SIZE
+        mac_mini_reading_history_size = 20  # credit_ocr._READING_HISTORY_SIZE
         seconds_of_history = mac_mini_reading_history_size * agent.CAPTURE_INTERVAL_WITHIN_BURST
         assert round(seconds_of_history, 3) == 1.0
 
@@ -186,18 +186,23 @@ class TestConsecutiveFailureTracker:
         """
         assert agent.IDLE_CHECK_INTERVAL <= agent.CAPTURE_INTERVAL_WITHIN_BURST
 
-    def test_the_new_round_gap_matches_what_the_mac_mini_enforces(self):
+    def test_the_new_round_gap_is_no_longer_the_mac_minis_staleness_cutoff(self):
         """
-        The second pairing that spans both repos. This agent decides when
-        to reset the reading history; the Mac Mini independently discards a
-        window older than credit_ocr._READING_MAX_AGE_SECONDS, so that a
-        reset which never arrives cannot leave a previous round's budget
-        deciding what viewers may vote for. They are the same fact and have
-        to be the same number - if this one were longer, the Mac Mini would
-        blank a window the agent still considers live.
+        These two used to be pinned equal, and that was wrong (fix #13,
+        credit_ocr.py's finding #9 there). This constant is the gap between
+        two PRESSES of B; the Mac Mini's cutoff was the age of a READING,
+        and the two are not the same duration at all. A buy phase is read
+        in about two seconds and the round after it runs well over a
+        minute, so matching them meant a correct reading was thrown away
+        for most of every round.
+
+        Nothing has to match now, because the phase id says outright which
+        round a capture belongs to. This asserts the shape rather than a
+        number: the Mac Mini's backstop must comfortably OUTLAST this gap,
+        never equal it.
         """
-        mac_mini_reading_max_age_seconds = 20  # credit_ocr._READING_MAX_AGE_SECONDS
-        assert agent.NEW_ROUND_GAP_SECONDS == mac_mini_reading_max_age_seconds
+        mac_mini_reading_max_age_seconds = 300  # credit_ocr._READING_MAX_AGE_SECONDS
+        assert mac_mini_reading_max_age_seconds > agent.NEW_ROUND_GAP_SECONDS * 5
 
     def test_a_new_round_gap_comfortably_outlasts_a_whole_burst_of_captures(self):
         """
@@ -207,6 +212,68 @@ class TestConsecutiveFailureTracker:
         buy phase as the start of the next.
         """
         assert agent.NEW_ROUND_GAP_SECONDS >= agent.CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT * agent.CAPTURE_INTERVAL_WITHIN_BURST
+
+
+class TestTheBuyPhaseHeader:
+    """
+    Fix #13. The Mac Mini used to age its reading window out after twenty
+    seconds purely because a reset POST can go missing, and that age also
+    erased a perfectly good reading in the middle of a live round. The id
+    of the buy phase now rides on every capture, so the Mac Mini can see a
+    new round arrive whether or not the reset did.
+    """
+
+    @patch("agent.requests.post")
+    def test_a_capture_carries_the_phase_it_was_taken_in(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"credits": 4900})
+        agent.capture_and_send(make_config(), cropped=Image.new("RGB", (150, 45)), buy_phase=7)
+        assert mock_post.call_args.kwargs["headers"]["X-Buy-Phase"] == "7"
+
+    @patch("agent.requests.post")
+    def test_the_reset_carries_it_too(self, mock_post):
+        """
+        Both messages declare the same phase, and whichever reaches the Mac
+        Mini first is the one that clears the window - the other is
+        recognised as already handled rather than clearing a second time
+        and wiping the readings this phase has already produced.
+        """
+        agent.reset_history(make_config(), buy_phase=7)
+        assert mock_post.call_args.kwargs["headers"]["X-Buy-Phase"] == "7"
+
+    @patch("agent.requests.post")
+    def test_no_phase_means_no_header_at_all(self, mock_post):
+        """
+        Absent rather than empty or zero. The Mac Mini treats a missing
+        header as "this agent predates the id" and falls back to the reset
+        POST alone; a header holding something meaningless would instead
+        look like a real phase and clear the window on every capture.
+        """
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"credits": 4900})
+        agent.capture_and_send(make_config(), cropped=Image.new("RGB", (150, 45)))
+        assert "X-Buy-Phase" not in mock_post.call_args.kwargs["headers"]
+
+
+class TestBackpressure:
+    """
+    Fix #12's other half. This process can grab frames far faster than a
+    2012 Mac Mini can OCR them, and the send pool's queue is unbounded, so
+    asking for a rate the backend cannot retire turns the surplus into a
+    backlog. Every frame in a backlog arrives late, which is worse than
+    never taking it: the reading from the end of a burst lands after the
+    roulette has already read the consensus.
+    """
+
+    def test_the_cap_is_about_a_second_of_captures(self):
+        seconds_of_backlog = agent.MAX_PENDING_CAPTURES * agent.CAPTURE_INTERVAL_WITHIN_BURST
+        assert 1.0 <= seconds_of_backlog <= 2.0
+
+    def test_enough_workers_to_retire_the_capture_rate(self):
+        """
+        The in-flight limit has to be at least a round trip's worth of
+        captures or it becomes the real ceiling on the rate, which is
+        exactly what happened at 4 workers when the rate went to 10/sec.
+        """
+        assert agent.MAX_CONCURRENT_REQUESTS >= 1 / agent.CAPTURE_INTERVAL_WITHIN_BURST / 2
 
 
 class TestResetHistory:
