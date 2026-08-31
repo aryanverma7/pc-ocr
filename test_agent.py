@@ -96,13 +96,82 @@ class TestConsecutiveFailureTracker:
     # threshold can't leave these tests quietly asserting the old value.
     THRESHOLD = agent.CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT
 
+    UNARMED = agent.CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT_UNARMED
+
+    def armed_tracker(self):
+        """
+        A tracker that has seen the menu, which since fix #14 is what lets
+        a run of 422s end a burst at the short threshold. Most of these
+        tests are about the counting, so they start from there.
+        """
+        tracker = self.tracker()
+        tracker.record_status(200)
+        return tracker
+
+    def tracker(self):
+        return agent.ConsecutiveFailureTracker(threshold=self.THRESHOLD, unarmed_threshold=self.UNARMED)
+
     def test_does_not_exit_early_before_reaching_the_threshold(self):
-        tracker = agent.ConsecutiveFailureTracker(threshold=self.THRESHOLD)
+        tracker = self.armed_tracker()
         for _ in range(self.THRESHOLD - 1):
             tracker.record_status(422)
         assert tracker.should_early_exit() is False
 
     def test_exits_early_once_the_threshold_is_reached(self):
+        tracker = self.armed_tracker()
+        for _ in range(self.THRESHOLD):
+            tracker.record_status(422)
+        assert tracker.should_early_exit() is True
+
+    def test_a_burst_that_never_read_anything_never_exits_early(self):
+        """
+        Fix #14, and the whole reason the threshold could be cut to 0.5s.
+        A long run of 422s means "the menu has gone" only if the menu was
+        ever there. The same run at the START of a burst means the
+        opposite - the menu's fade-in draws the panel before the label is
+        legible, and a B press that was really a close opens nothing at
+        all - and ending a burst that had not begun is the mistake the old
+        1.5 seconds was slack for.
+
+        Such a burst still ends, on the longer unarmed threshold - the old
+        1.5 seconds, unchanged. Without that a B-toggle close would capture
+        for the whole burst duration, which is the cost that made deleting
+        the early exit outright a bad trade.
+        """
+        tracker = self.tracker()
+        for _ in range(self.THRESHOLD):
+            tracker.record_status(422)
+        assert tracker.should_early_exit() is False
+
+    def test_a_burst_that_never_read_anything_ends_on_the_longer_threshold(self):
+        tracker = self.tracker()
+        for _ in range(self.UNARMED - 1):
+            tracker.record_status(422)
+        assert tracker.should_early_exit() is False
+        tracker.record_status(422)
+        assert tracker.should_early_exit() is True
+
+    def test_the_unarmed_threshold_is_the_old_one_and_a_real_second_and_a_half(self):
+        """
+        Pinned as a duration, like its armed twin: the two situations it
+        covers - the menu's fade-in and a B press that was really a close -
+        both resolve within about a second, which is what 1.5s was chosen
+        against and why it did not need to move.
+        """
+        assert self.UNARMED > self.THRESHOLD
+        assert round(self.UNARMED * agent.CAPTURE_INTERVAL_WITHIN_BURST, 3) == 1.5
+
+    def test_one_real_reading_is_enough_to_arm_it(self):
+        tracker = self.tracker()
+        for _ in range(self.THRESHOLD):
+            tracker.record_status(422)   # fade-in, short of the unarmed threshold
+        tracker.record_status(200)       # the menu is up
+        for _ in range(self.THRESHOLD):
+            tracker.record_status(422)   # and now it is gone
+        assert tracker.should_early_exit() is True
+
+    def test_a_default_tracker_uses_one_threshold_for_both(self):
+        """Built with one number, it behaves like one number - the two-threshold split is opt-in."""
         tracker = agent.ConsecutiveFailureTracker(threshold=self.THRESHOLD)
         for _ in range(self.THRESHOLD):
             tracker.record_status(422)
@@ -115,7 +184,7 @@ class TestConsecutiveFailureTracker:
         count toward "the menu has closed" - only a genuinely CONSECUTIVE
         run of failures should.
         """
-        tracker = agent.ConsecutiveFailureTracker(threshold=self.THRESHOLD)
+        tracker = self.armed_tracker()
         for _ in range(self.THRESHOLD - 1):
             tracker.record_status(422)
         tracker.record_status(200)  # one success resets the streak
@@ -129,7 +198,7 @@ class TestConsecutiveFailureTracker:
         shouldn't accidentally build toward the "menu closed" threshold,
         nor should they reset a genuine 422 streak.
         """
-        tracker = agent.ConsecutiveFailureTracker(threshold=self.THRESHOLD)
+        tracker = self.armed_tracker()
         before = self.THRESHOLD // 2
         after = self.THRESHOLD - before
         for _ in range(before):
@@ -142,26 +211,44 @@ class TestConsecutiveFailureTracker:
         assert tracker.should_early_exit() is True  # the streak spans the interruptions
 
     def test_reset_clears_the_count(self):
-        tracker = agent.ConsecutiveFailureTracker(threshold=self.THRESHOLD)
+        tracker = self.armed_tracker()
         for _ in range(self.THRESHOLD):
             tracker.record_status(422)
         assert tracker.should_early_exit() is True
         tracker.reset()
         assert tracker.should_early_exit() is False
 
-    def test_the_threshold_is_a_duration_of_about_1_5_seconds_at_the_real_capture_rate(self):
+    def test_reset_also_disarms_it(self):
+        """
+        Reset marks the start of a new look at the menu, and a reading
+        from the PREVIOUS look must not arm this one - otherwise a B press
+        that opens nothing inherits the last burst's evidence that the
+        menu was up, and the fade-in run it was meant to ignore ends the
+        burst after all.
+        """
+        tracker = self.armed_tracker()
+        tracker.reset()
+        for _ in range(self.THRESHOLD):
+            tracker.record_status(422)
+        assert tracker.should_early_exit() is False
+
+    def test_the_threshold_is_a_duration_of_about_half_a_second_at_the_real_capture_rate(self):
         """
         Pinned deliberately. Like the Mac Mini's consensus window, this is
-        a duration expressed in readings - the count only means "1.5
+        a duration expressed in readings - the count only means "0.5
         seconds" at a particular CAPTURE_INTERVAL_WITHIN_BURST, so the two
         have to be retuned together. Asserting the product rather than
         just the two numbers is the point: it is the seconds that were
         chosen, and the count is only how they get expressed.
+
+        It was 1.5s, and the cut is fix #14: that slack existed to outlast
+        a run of 422s at the start of a burst, and the arming rule above
+        rules those out by construction instead.
         """
         seconds_before_early_exit = (
             agent.CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT * agent.CAPTURE_INTERVAL_WITHIN_BURST
         )
-        assert round(seconds_before_early_exit, 3) == 1.5
+        assert round(seconds_before_early_exit, 3) == 0.5
 
     def test_the_consensus_window_on_the_mac_mini_covers_about_a_second_at_this_rate(self):
         """

@@ -169,6 +169,29 @@ phase. The Mac Mini clears its window when that id changes, so a dropped
 reset costs nothing and a reading can safely live until the next time B
 is actually pressed. See credit_ocr.py's finding #9 there.
 
+Real-world fix #14, from the observation that Esc is pressed on every
+close that is made by hand. That makes the early exit's 1.5 seconds look
+like pure waste - and it very nearly is, but not quite: the menu is also
+closed by the ROUND STARTING while it is still open, which is exactly
+what a purchase made at the last second looks like, and that close
+involves no keystroke for anything here to hook. Deleting the early exit
+outright would leave those rounds capturing until burst_duration_seconds
+expires - about 120 unreadable frames at the rate above, each one a
+Tesseract run on a 2012 Mac Mini, exactly while a !roulette may be
+reading the consensus.
+
+So it is retuned rather than removed, and the retune is what the Esc hook
+finally makes safe. The 1.5 seconds was never about how long it takes to
+be sure the menu is gone; it was slack for the opposite mistake - a run
+of 422s at the START of a burst, on the menu's fade-in or on a B press
+that was really a close, ending a burst that had not begun. The tracker
+now simply refuses to fire until the burst has produced one real reading,
+which rules that out by construction, so the threshold drops to 10 frames
+(0.5s) and the junk after a round-start close falls by two thirds. A burst
+that has read nothing keeps the old 30 frames, unchanged - both situations
+that produce one resolve within about a second, and without that fallback
+a B-toggle close would capture for the whole burst duration.
+
 Requires calibrate.py to have been run at least once first, and
 agent_secret in agent_config.json to match the Mac Mini's own
 ocr_agent_secret in config.json exactly - they're the same value on
@@ -220,19 +243,39 @@ IDLE_CHECK_INTERVAL = 0.02  # how often to check whether a burst just started, w
 # does nothing but read a float and compare it, so checking more often
 # costs nothing measurable next to the screenshots it gates.
 
-# 1.5 seconds at the 20/sec rate above - see fix #4. Keep these two
+# Half a second at the 20/sec rate above - see fix #4. Keep these two
 # constants in step: this is a duration expressed in readings, so changing
 # CAPTURE_INTERVAL_WITHIN_BURST without changing this silently changes how
 # long the agent waits before deciding the buy menu closed.
 #
-# Fix #10 made this the only way a close was ever noticed; fix #11 hooked
-# Esc and took the common case back off it. What is left for it are the
-# two closes with no keystroke at all - a B-toggle close, and the round
-# starting while the menu is still open - so it fires rarely now, and the
-# 1.5 seconds remains a balance between two costs: too short and a run of
-# frames caught on the menu's fade-in ends a burst while the menu is still
-# open, too long and the burst spends its tail POSTing gameplay content.
-CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 30
+# Fix #14 cut this from 1.5 seconds. The 1.5 was a balance against one
+# specific false positive: a run of frames caught on the menu's FADE-IN,
+# where the label is not drawn yet, ending a burst while the menu is
+# actually still opening. The tracker now refuses to fire until the burst
+# has produced at least one real reading, which rules that out by
+# construction rather than by waiting it out, so the only thing left to
+# balance is how much gameplay content the tail of a burst POSTs - and on
+# that, shorter is simply better.
+#
+# What this still covers, and why it was not deleted outright: the menu is
+# closed three ways, and Esc (fix #11) is only one of them. A B-toggle
+# close is another, and the round starting while the menu is still open is
+# the third - which is precisely the fast buy this whole pipeline is tuned
+# for, and involves no keystroke at all. Without this, those rounds keep
+# capturing until burst_duration_seconds expires: at 20/sec and a 6s
+# burst, about 120 unreadable frames, each one a Tesseract run on a 2012
+# Mac Mini, exactly while a !roulette may be reading the consensus.
+CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 10
+
+# The same decision for a burst that has never read anything, where the
+# arming rule above cannot help because there is nothing to arm on. Both
+# of the situations that produce it - the menu's fade-in, and a B press
+# that was really a close - resolve within about a second, so this is the
+# old 1.5-second threshold kept exactly as it was, as the slower fallback
+# it always was. Without it a B-toggle close would capture for the whole
+# burst_duration_seconds, which is the cost that made deleting the early
+# exit outright a bad trade in the first place.
+CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT_UNARMED = 30
 
 # Real-world fix #5: the 0.25s interval above was already "4 images/second"
 # on paper, but the loop used to call capture_and_send() - screenshot AND
@@ -287,26 +330,50 @@ class ConsecutiveFailureTracker:
     Tracks consecutive "no number found" responses, separate from the
     main loop so this specific piece of logic is directly testable -
     real success/failure sequences, not just eyeballing the loop.
+
+    A run of failures only means "the menu has closed" if the menu was
+    ever open, and this cannot fire until the burst has produced at least
+    one real reading (fix #14). Two different things produce a long run of
+    422s: the menu having gone, and the menu not having arrived yet - its
+    fade-in draws the panel before the label is legible, and a press that
+    was really a B-toggle CLOSE opens nothing at all. Only the first of
+    those is a reason to stop capturing, and "have we read anything yet"
+    separates them exactly, where the old 1.5-second threshold only
+    outlasted them approximately.
+
+    A burst that never reads anything still ends, on `unarmed_threshold` -
+    the old 1.5 seconds, unchanged, as the slower fallback it always was.
+    Otherwise a B-toggle close would capture for the whole burst duration,
+    which is the cost that made deleting the early exit a bad trade.
     """
 
-    def __init__(self, threshold: int):
+    def __init__(self, threshold: int, unarmed_threshold: "int | None" = None):
         self.threshold = threshold
+        # Defaulting to `threshold` rather than to the module constant, so
+        # a tracker built with one number behaves like one number.
+        self.unarmed_threshold = threshold if unarmed_threshold is None else unarmed_threshold
         self._count = 0
+        self._seen_a_reading = False
 
     def record_status(self, status_code: "int | None") -> None:
         if status_code == 422:
             self._count += 1
         elif status_code == 200:
+            self._seen_a_reading = True
             self._count = 0
         # Any other status (401/503/network error/None) leaves the count
         # untouched - those are different problems entirely, unrelated to
         # whether the menu is still open.
 
     def should_early_exit(self) -> bool:
-        return self._count >= self.threshold
+        limit = self.threshold if self._seen_a_reading else self.unarmed_threshold
+        return self._count >= limit
 
     def reset(self) -> None:
+        # Both, because reset marks the start of a new look at the menu -
+        # a reading from the previous one must not arm this one.
         self._count = 0
+        self._seen_a_reading = False
 
 
 def capture_and_send(config: dict, cropped=None, buy_phase: "int | None" = None) -> "int | None":
@@ -473,7 +540,10 @@ def main():
     new_round_gap = config.get("new_round_gap_seconds", NEW_ROUND_GAP_SECONDS)
     burst = BurstTimer(duration_seconds=burst_duration, new_round_gap_seconds=new_round_gap)
 
-    failure_tracker = ConsecutiveFailureTracker(threshold=CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT)
+    failure_tracker = ConsecutiveFailureTracker(
+        threshold=CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT,
+        unarmed_threshold=CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT_UNARMED,
+    )
     # Guards failure_tracker + burst.force_end() below, since those get
     # touched from whichever worker thread happens to finish a request and
     # from the keyboard hook's own thread, not just the main loop (fix #5).
@@ -594,8 +664,8 @@ def main():
             with tracker_lock:
                 failure_tracker.record_status(status)
                 if failure_tracker.should_early_exit():
-                    print(f"{CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT} consecutive 'no number found' responses - "
-                          f"assuming the buy menu already closed, ending this burst early.")
+                    print("A run of 'no number found' responses - assuming the buy menu already closed, "
+                          "ending this burst early.")
                     burst.force_end()
                     failure_tracker.reset()
         finally:
