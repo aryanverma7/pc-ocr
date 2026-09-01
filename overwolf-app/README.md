@@ -26,6 +26,19 @@ buy phase and nowhere else. Nothing on the Mac Mini makes a decision from this f
 it is shown on the dashboard next to the OCR reading so the two can be compared over a real
 session before either replaces the other.
 
+## Riot Games compliance
+
+Overwolf's Riot compliance guidelines apply **"even if you do not intend to use the Riot API
+itself"**, which this app does not — its data comes from Overwolf's Game Events Provider. Two
+consequences:
+
+- The disclaimer Overwolf mandates is carried in `manifest.json`'s description and shown in the
+  status window. Its wording is theirs, verbatim, and should not be paraphrased.
+- Publication requires Riot's own approval through their [third-party application
+  process](https://developer.riotgames.com/docs/portal#_getting-started), in addition to
+  Overwolf's whitelisting. Loading the app unpacked for personal use does not, but Overwolf asks
+  for the Riot approval before whitelisting a developer account.
+
 ## Install
 
 Overwolf is Windows-only, so this goes on the gaming PC, not the Mac Mini.

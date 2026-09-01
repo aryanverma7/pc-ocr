@@ -22,6 +22,9 @@
     .bad{color:var(--bad); font-weight:600;}
     .warn{color:var(--gold); font-weight:600;}
     .card{background:var(--panel); border:1px solid rgba(52,245,197,.18); padding:10px 12px; margin-bottom:12px;}
+    .disclaimer{
+      margin:10px 0 0; font-size:10px; line-height:1.4; color:var(--paper-dim); opacity:.75;
+    }
     #log{
       background:#0B121A; border:1px solid rgba(154,163,172,.18); padding:8px;
       height:190px; overflow:auto; font-family:Consolas,monospace; font-size:11px;
@@ -50,6 +53,17 @@
   </div>
 
   <div id="log"></div>
+
+  <!--
+    Required by Overwolf's Riot Games compliance guidelines, which apply
+    "even if you do not intend to use the Riot API itself" - as this app
+    does not. Wording is theirs, not a paraphrase.
+  -->
+  <p class="disclaimer">
+    DualBladeX Game Events isn't endorsed by Riot Games and doesn't reflect the views or
+    opinions of Riot Games or anyone officially involved in producing or managing Riot Games
+    properties.
+  </p>
   <script src="status.js"></script>
 </body>
 </html>

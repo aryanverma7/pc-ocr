@@ -8,9 +8,11 @@
     "author": "DualBladeX",
     "icon": "icons/icon.png",
     "icon_gray": "icons/icon_gray.png",
-    "description": "Reports live Valorant round state to the DualBladeX stream backend."
+    "description": "Reports live Valorant round state to the DualBladeX stream backend. DualBladeX Game Events isn't endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties."
   },
-  "permissions": ["GameInfo"],
+  "permissions": [
+    "GameInfo"
+  ],
   "data": {
     "start_window": "background",
     "windows": {
@@ -23,19 +25,33 @@
         "desktop_only": true,
         "resizable": true,
         "transparent": false,
-        "size": { "width": 560, "height": 520 },
-        "min_size": { "width": 420, "height": 320 }
+        "size": {
+          "width": 560,
+          "height": 520
+        },
+        "min_size": {
+          "width": 420,
+          "height": 320
+        }
       }
     },
     "game_targeting": {
       "type": "dedicated",
-      "game_ids": [21640]
+      "game_ids": [
+        21640
+      ]
     },
-    "game_events": [21640],
+    "game_events": [
+      21640
+    ],
     "launch_events": [
       {
         "event": "GameLaunch",
-        "event_data": { "game_ids": [21640] },
+        "event_data": {
+          "game_ids": [
+            21640
+          ]
+        },
         "start_minimized": true
       }
     ]
