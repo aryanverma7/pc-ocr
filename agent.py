@@ -212,9 +212,22 @@ import requests
 from PIL import ImageGrab
 
 from burst_timer import BurstTimer, NEW_ROUND_GAP_SECONDS
-from region import load_config, is_calibrated, crop_to_region
+from region import load_config, is_calibrated, crop_to_region, region_bbox
 
-CAPTURE_INTERVAL_WITHIN_BURST = 0.05  # 20 images/second
+# How many screenshots a second a burst takes. Config-driven since fix
+# #15, because it is the one number worth turning down on a machine that
+# is also running the game - and turning it down should not need an edit
+# to this file mid-session.
+#
+# Read at import, not per tick: the loop reads it twenty times a second
+# and the value cannot change without a restart anyway.
+DEFAULT_CAPTURES_PER_SECOND = 20
+try:
+    CAPTURES_PER_SECOND = max(1.0, float(load_config().get("captures_per_second", DEFAULT_CAPTURES_PER_SECOND)))
+except (TypeError, ValueError):
+    CAPTURES_PER_SECOND = float(DEFAULT_CAPTURES_PER_SECOND)
+
+CAPTURE_INTERVAL_WITHIN_BURST = 1.0 / CAPTURES_PER_SECOND
 
 # Raised 4/sec to 10/sec for fix #9, and 10/sec to 20/sec for fix #12. A
 # buy menu that is opened and closed in a couple of seconds used to yield
@@ -265,7 +278,17 @@ IDLE_CHECK_INTERVAL = 0.02  # how often to check whether a burst just started, w
 # capturing until burst_duration_seconds expires: at 20/sec and a 6s
 # burst, about 120 unreadable frames, each one a Tesseract run on a 2012
 # Mac Mini, exactly while a !roulette may be reading the consensus.
-CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 10
+# DURATIONS, from which the frame counts are derived - the other way
+# round from how this used to be written, and the reason is fix #15's
+# config knob. These two numbers were only ever "0.5 seconds" and "1.5
+# seconds"; expressing them as frame counts meant that turning the
+# capture rate down silently turned them into 1s and 3s, which is exactly
+# the class of mistake the comment above them warned about and could not
+# prevent.
+EARLY_EXIT_SECONDS = 0.5
+EARLY_EXIT_UNARMED_SECONDS = 1.5
+
+CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = max(1, round(EARLY_EXIT_SECONDS * CAPTURES_PER_SECOND))
 
 # The same decision for a burst that has never read anything, where the
 # arming rule above cannot help because there is nothing to arm on. Both
@@ -275,7 +298,7 @@ CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT = 10
 # it always was. Without it a B-toggle close would capture for the whole
 # burst_duration_seconds, which is the cost that made deleting the early
 # exit outright a bad trade in the first place.
-CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT_UNARMED = 30
+CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT_UNARMED = max(1, round(EARLY_EXIT_UNARMED_SECONDS * CAPTURES_PER_SECOND))
 
 # Real-world fix #5: the 0.25s interval above was already "4 images/second"
 # on paper, but the loop used to call capture_and_send() - screenshot AND
@@ -314,7 +337,7 @@ MAX_CONCURRENT_REQUESTS = 16  # in-flight requests before new ones queue behind 
 # Sized at just over a second of captures. Small enough that a saturated
 # pipeline stays within a second of live; large enough that an ordinary
 # slow round trip never trips it.
-MAX_PENDING_CAPTURES = 24
+MAX_PENDING_CAPTURES = max(4, round(1.2 * CAPTURES_PER_SECOND))
 
 # Three of these fit inside the Mac Mini's own 45-second staleness window
 # (ocr_agent.HEARTBEAT_TIMEOUT_SECONDS), so a couple of dropped pings in a
@@ -376,6 +399,20 @@ class ConsecutiveFailureTracker:
         self._seen_a_reading = False
 
 
+def grab_region(region: dict):
+    """
+    A screenshot of ONLY the calibrated region.
+
+    Real-world fix #15. This used to be ImageGrab.grab() - the whole
+    screen - followed by a crop, which threw away 99% of what it had just
+    captured. A full-screen grab is not cheap on Windows, and at twenty a
+    second during a buy phase it was costing frames in the game, on the
+    same machine, at exactly the moment the streamer is trying to click
+    things. Handing the box to ImageGrab means the capture is the region.
+    """
+    return ImageGrab.grab(bbox=region_bbox(region))
+
+
 def capture_and_send(config: dict, cropped=None, buy_phase: "int | None" = None) -> "int | None":
     """
     Returns the response's HTTP status code, or None if the request itself
@@ -401,7 +438,7 @@ def capture_and_send(config: dict, cropped=None, buy_phase: "int | None" = None)
     to the grab it already does.
     """
     if cropped is None:
-        cropped = crop_to_region(ImageGrab.grab(), config["region"])
+        cropped = grab_region(config["region"])
 
     buffer = io.BytesIO()
     cropped.save(buffer, format="PNG")
@@ -707,7 +744,7 @@ def main():
                             was_saturated = False
                         # Grab happens right here, on-schedule, every tick -
                         # never delayed by a busy worker or a slow backend.
-                        cropped = crop_to_region(ImageGrab.grab(), config["region"])
+                        cropped = grab_region(config["region"])
                         executor.submit(send_in_background, config, cropped, burst.generation, buy_phase_id)
 
                 # Well under one capture interval, so the tick above lands

@@ -29,6 +29,22 @@ def normalize_region(x1: int, y1: int, x2: int, y2: int) -> dict:
     return {"left": left, "top": top, "width": width, "height": height}
 
 
+def region_bbox(region: dict) -> tuple:
+    """
+    The calibrated region as a (left, top, right, bottom) box, which is
+    what PIL's ImageGrab.grab(bbox=...) wants.
+
+    This exists because grabbing the whole screen and cropping afterwards
+    is what agent.py used to do, and it is enormously more expensive: the
+    credit region is a few hundred pixels, a 1080p screen is two million,
+    and the difference is paid twenty times a second during every buy
+    phase - on the machine that is also running the game.
+    """
+    left = region["left"]
+    top = region["top"]
+    return (left, top, left + region["width"], top + region["height"])
+
+
 def crop_to_region(full_image, region: dict):
     """
     Crops a full screenshot down to the calibrated region. Takes any

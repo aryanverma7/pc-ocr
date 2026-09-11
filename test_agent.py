@@ -159,7 +159,7 @@ class TestConsecutiveFailureTracker:
         against and why it did not need to move.
         """
         assert self.UNARMED > self.THRESHOLD
-        assert round(self.UNARMED * agent.CAPTURE_INTERVAL_WITHIN_BURST, 3) == 1.5
+        assert round(self.UNARMED * agent.CAPTURE_INTERVAL_WITHIN_BURST, 3) == agent.EARLY_EXIT_UNARMED_SECONDS
 
     def test_one_real_reading_is_enough_to_arm_it(self):
         tracker = self.tracker()
@@ -248,7 +248,7 @@ class TestConsecutiveFailureTracker:
         seconds_before_early_exit = (
             agent.CONSECUTIVE_FAILURES_BEFORE_EARLY_EXIT * agent.CAPTURE_INTERVAL_WITHIN_BURST
         )
-        assert round(seconds_before_early_exit, 3) == 0.5
+        assert round(seconds_before_early_exit, 3) == agent.EARLY_EXIT_SECONDS
 
     def test_the_consensus_window_on_the_mac_mini_covers_about_a_second_at_this_rate(self):
         """
@@ -260,7 +260,7 @@ class TestConsecutiveFailureTracker:
         there silently shortens how far back the consensus reaches.
         """
         mac_mini_reading_history_size = 20  # credit_ocr._READING_HISTORY_SIZE
-        seconds_of_history = mac_mini_reading_history_size * agent.CAPTURE_INTERVAL_WITHIN_BURST
+        seconds_of_history = mac_mini_reading_history_size / agent.DEFAULT_CAPTURES_PER_SECOND
         assert round(seconds_of_history, 3) == 1.0
 
     def test_the_idle_check_is_short_enough_not_to_eat_the_start_of_a_short_buy_phase(self):
@@ -353,6 +353,16 @@ class TestBackpressure:
     def test_the_cap_is_about_a_second_of_captures(self):
         seconds_of_backlog = agent.MAX_PENDING_CAPTURES * agent.CAPTURE_INTERVAL_WITHIN_BURST
         assert 1.0 <= seconds_of_backlog <= 2.0
+
+    def test_the_thresholds_hold_their_durations_at_any_capture_rate(self):
+        """
+        Fix #15 made the rate config-driven, which is only safe because
+        everything derived from it is expressed in seconds. Turning the
+        rate down used to turn 0.5s into 1s silently.
+        """
+        for rate in (5, 10, 20, 30):
+            interval = 1.0 / rate
+            assert abs(max(1, round(agent.EARLY_EXIT_SECONDS * rate)) * interval - agent.EARLY_EXIT_SECONDS) < 0.11
 
     def test_enough_workers_to_retire_the_capture_rate(self):
         """
