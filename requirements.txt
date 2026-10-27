@@ -11,6 +11,10 @@
 Pillow>=11.0.0
 requests>=2.31.0
 keyboard>=0.13.5
+# uploader.py ("Send to editor"):
+pystray>=0.19.5  # the tray icon showing upload progress
+pymediainfo>=6.1.0  # reads a video's length (under 5 minutes = clip)
+obsws-python>=1.7.0  # asks OBS whether you are live, to pause uploads
 
 # tkinter (used by calibrate.py) is part of Python's standard library,
 # not installed via pip - it comes bundled with the standard python.org

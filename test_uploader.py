@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import sys
 
 import pytest
 import requests
@@ -495,3 +496,103 @@ def test_pending_tolerates_bad_job_already_renamed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(uploader.os, "replace", gone)
     assert uploader._pending(jobs) == []
+
+
+# --- main ---------------------------------------------------------------------
+
+@pytest.fixture
+def app(tmp_path, monkeypatch):
+    jobs = tmp_path / "uploads"
+    monkeypatch.setattr(uploader, "JOBS_DIR", jobs)
+    monkeypatch.setattr(uploader, "_setup_logging", lambda: None)
+    monkeypatch.setattr(uploader, "load_config", lambda: {
+        "backend_url": "https://hub.example/api/ocr/credit-report", "agent_secret": "s"})
+    monkeypatch.delitem(sys.modules, "pystray", raising=False)
+    return jobs
+
+
+def test_main_resume_with_empty_queue_exits_without_tray(app):
+    assert uploader.main(["--resume"]) == 0
+    assert "pystray" not in sys.modules
+
+
+def test_main_exits_when_lock_held(app, tmp_path, monkeypatch):
+    clip = make_file(tmp_path, "clip.mp4")
+    monkeypatch.setattr(uploader, "media_duration", lambda p: 42.0)
+    held = uploader.try_lock(app)
+    try:
+        assert uploader.main([str(clip)]) == 0
+    finally:
+        uploader.unlock(held)
+    assert "pystray" not in sys.modules
+    assert load_one(app)["path"] == str(clip)  # the running worker takes it
+
+
+def test_main_without_secret_returns_1(app, monkeypatch):
+    monkeypatch.setattr(uploader, "load_config", lambda: {"backend_url": "x", "agent_secret": ""})
+    assert uploader.main(["--resume"]) == 1
+
+
+def test_enqueue_summary_line_formats_clip_and_vod():
+    assert uploader.summary_line("C:\\v\\clip_42.mp4", 42.4) == "clip_42.mp4: 0:42, clip"
+    assert uploader.summary_line("/v/stream.mkv", 3 * 3600 + 12 * 60 + 5) == "stream.mkv: 3:12:05, VOD"
+    assert uploader.summary_line("/v/five.mp4", 300) == "five.mp4: 5:00, VOD"
+    assert uploader.summary_line("/v/odd.mp4", None) == "odd.mp4: length unknown, VOD"
+
+
+def test_base_url_strips_path():
+    assert uploader.base_url("https://hub.example/api/ocr/credit-report") == "https://hub.example"
+    assert uploader.base_url("http://10.0.0.5:8765/api/ocr/credit-report") == "http://10.0.0.5:8765"
+
+
+def fake_pystray(notes):
+    class Icon:
+        def __init__(self, name, image, title, menu):
+            self.title, self.stopped = title, False
+
+        def notify(self, text, title=None):
+            notes.append(text)
+
+        def run(self, setup):
+            setup(self)
+
+        def stop(self):
+            self.stopped = True
+
+    return type(sys)("pystray"), Icon
+
+
+def test_main_tray_shows_summary_and_drops_then_releases_lock(app, tmp_path, monkeypatch):
+    notes = []
+    mod, Icon = fake_pystray(notes)
+    mod.Icon, mod.Menu, mod.MenuItem = Icon, lambda *a: a, lambda *a: a
+    monkeypatch.setitem(sys.modules, "pystray", mod)
+    monkeypatch.setattr(uploader, "_icon_image", lambda: None)
+    monkeypatch.setattr(uploader, "NOTIFY_LINGER_SECONDS", 0)
+    monkeypatch.setattr(uploader, "media_duration", lambda p: 42.0)
+    monkeypatch.setattr(uploader, "run_job", lambda job, *a, jobs_dir, **k: (
+        uploader._forget(job, jobs_dir), "dropped: clip.mp4 was refused")[1])
+    clip = make_file(tmp_path, "clip.mp4")
+    assert uploader.main([str(clip), str(tmp_path / "gone.mp4")]) == 0
+    assert notes == ["clip.mp4: 0:42, clip\ngone.mp4 was not found", "clip.mp4 was refused"]
+    held = uploader.try_lock(app)  # drain released it
+    assert held is not None
+    uploader.unlock(held)
+
+
+def test_main_bad_secret_notifies(app, tmp_path, monkeypatch):
+    notes = []
+    mod, Icon = fake_pystray(notes)
+    mod.Icon, mod.Menu, mod.MenuItem = Icon, lambda *a: a, lambda *a: a
+    monkeypatch.setitem(sys.modules, "pystray", mod)
+    monkeypatch.setattr(uploader, "_icon_image", lambda: None)
+    monkeypatch.setattr(uploader, "NOTIFY_LINGER_SECONDS", 0)
+
+    def bad(*a, **k):
+        raise uploader.BadSecret("no", 401)
+
+    monkeypatch.setattr(uploader, "run_job", bad)
+    uploader.enqueue([str(make_file(tmp_path))], app, lambda p: None)
+    assert uploader.main(["--resume"]) == 0
+    assert notes == ["The agent secret is wrong - check agent_config.json"]
+    assert len(queued(app)) == 1  # kept for after the secret is fixed

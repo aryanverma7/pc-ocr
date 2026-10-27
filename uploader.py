@@ -15,16 +15,21 @@ Never log the secret or an upload URL (the URL alone authorises the upload).
 import datetime
 import json
 import logging
+import logging.handlers
 import mimetypes
 import os
+import sys
+import threading
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 
 from drive_upload import SessionExpired, query_offset, send_from
-from live_gate import RECHECK_SECONDS
+from live_gate import RECHECK_SECONDS, LiveGate, backend_live_from, obs_streaming_from
+from region import load_config
 
 log = logging.getLogger("uploader")
 
@@ -353,3 +358,143 @@ def drain(jobs_dir, lock_fh, run, after_unlock=lambda: None) -> list:
     finally:
         if lock_fh is not None:
             unlock(lock_fh)
+
+
+# --- the app: tray icon, sleep prevention, entry point ----------------------------
+
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+CLIP_MAX_SECONDS = 300  # the backend's editor_store.CLIP_MAX_SECONDS decides; this only labels
+NOTIFY_LINGER_SECONDS = 8  # removing the icon removes its last notification with it
+
+
+def _clock(seconds) -> str:
+    s = int(seconds)
+    h, m, s = s // 3600, s // 60 % 60, s % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def summary_line(path, duration_s) -> str:
+    name = os.path.basename(path.replace("\\", "/"))
+    if duration_s is None:
+        return f"{name}: length unknown, VOD"
+    kind = "clip" if duration_s < CLIP_MAX_SECONDS else "VOD"
+    return f"{name}: {_clock(duration_s)}, {kind}"
+
+
+def base_url(backend_url: str) -> str:
+    u = urlsplit(backend_url)
+    return f"{u.scheme}://{u.netloc}"
+
+
+def _setup_logging() -> None:
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    h = logging.handlers.RotatingFileHandler(JOBS_DIR / "uploader.log", maxBytes=1_000_000,
+                                             backupCount=2, encoding="utf-8")
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log.addHandler(h)
+    log.setLevel(logging.INFO)
+
+
+def _icon_image():
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (64, 64), (20, 160, 150))
+    ImageDraw.Draw(img).polygon([(32, 8), (56, 34), (40, 34), (40, 56), (24, 56), (24, 34),
+                                 (8, 34)], fill="white")  # an upward arrow
+    return img
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    _setup_logging()
+    try:
+        cfg = load_config()
+        base, secret = base_url(cfg["backend_url"]), cfg["agent_secret"]
+        if not secret:
+            raise ValueError("agent_secret is empty")
+    except Exception as e:
+        log.error("agent_config.json is missing or invalid (%s)", type(e).__name__)
+        return 1
+
+    files = [a for a in argv if a != "--resume"]
+    lines = []
+    if files:
+        durations = {}
+
+        def duration(path):
+            durations[path] = media_duration(path)
+            return durations[path]
+
+        refused = enqueue(files, JOBS_DIR, duration)
+        lines = [summary_line(p, d) for p, d in durations.items()] + refused
+    if not files and not _pending(JOBS_DIR):
+        return 0
+    lock_fh = try_lock(JOBS_DIR)
+    if lock_fh is None:
+        return 0  # another instance holds the queue and will send these too
+
+    try:
+        import pystray  # Windows-side dependency; imported lazily
+    except ImportError:
+        log.error("pystray is not installed: run pip install -r requirements.txt")
+        unlock(lock_fh)
+        return 1
+
+    http = requests.Session()
+    backend = Backend(base, secret, http)
+    gate = LiveGate(obs_streaming_from(cfg), backend_live_from(base, secret, http))
+    stop = threading.Event()
+    count = {"n": 0, "total": len(_pending(JOBS_DIR))}
+    last_notify = [0.0]
+
+    def notify(text):
+        icon.notify(text[:255], "Send to editor")
+        last_notify[0] = time.monotonic()
+
+    def progress(name, offset, size, paused=False):
+        pct = int(offset * 100 / size) if size else 100
+        if paused:
+            title = f"Paused while live: {name} {pct}%"
+        else:
+            title = f"Sending to editor: {name} {pct}% ({count['n']} of {count['total']})"
+        icon.title = title[:127]  # Windows' tooltip limit
+
+    def run(job, jobs_dir):
+        count["n"] += 1
+        count["total"] = max(count["total"], count["n"])
+        result = run_job(job, backend, http, gate, progress, sleep=stop.wait,
+                         stop=stop.is_set, jobs_dir=jobs_dir)
+        if result.startswith("dropped: "):
+            notify(result[len("dropped: "):])
+        return result
+
+    def work(icon):
+        icon.visible = True
+        if sys.platform == "win32":
+            import ctypes
+
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+        try:
+            if lines:
+                notify("\n".join(lines))
+            drain(JOBS_DIR, lock_fh, run)
+        except BadSecret:
+            notify("The agent secret is wrong - check agent_config.json")
+        except Exception:
+            log.exception("uploader stopped unexpectedly")
+        finally:
+            if sys.platform == "win32":
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            stop.wait(max(0.0, last_notify[0] + NOTIFY_LINGER_SECONDS - time.monotonic()))
+            icon.stop()
+
+    menu = pystray.Menu(pystray.MenuItem("Stop (resumes at next login)",
+                                         lambda icon, item: stop.set()))
+    icon = pystray.Icon("dualbladex-uploader", _icon_image(), "Send to editor", menu)
+    icon.run(setup=work)  # drain releases the lock however it ends
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
