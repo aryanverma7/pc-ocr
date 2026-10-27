@@ -248,10 +248,51 @@ def test_run_job_drops_on_refused(tmp_path, drive):
 
 def test_run_job_bad_secret_propagates_and_keeps_job(tmp_path, drive):
     f, jobs, job = enqueue_one(tmp_path)
-    http = FakeHttp(resp(401, {"error": "unauthorized"}))
-    with pytest.raises(uploader.BadSecret):
+    http = FakeHttp(resp(401, {"error": "Invalid or missing agent secret"}))
+    with pytest.raises(uploader.BadSecret) as e:
         run(job, uploader.Backend("http://mini:8765", "s", http), jobs)
+    assert not isinstance(e.value, uploader.BackendTooOld)
     assert len(queued(jobs)) == 1
+
+
+def test_run_job_other_401_means_backend_too_old_and_keeps_job(tmp_path, drive):
+    f, jobs, job = enqueue_one(tmp_path)
+    http = FakeHttp(resp(401, {"error": "Not authenticated - open /auth/login in a browser tab, then retry."}))
+    with pytest.raises(uploader.BackendTooOld) as e:
+        run(job, uploader.Backend("http://mini:8765", "s", http), jobs)
+    assert e.value.message == "The Mac Mini backend needs updating before the uploader can work"
+    assert len(queued(jobs)) == 1
+
+
+def test_run_job_drops_when_file_changes_during_mid_file_pause(tmp_path, monkeypatch):
+    f, jobs, job = enqueue_one(tmp_path, size=100)
+    sends = []
+    monkeypatch.setattr(uploader, "query_offset", lambda http, url, total: 0)
+
+    def send_from(http, url, path, total, offset, on_chunk):
+        while offset < total:
+            sends.append(offset)
+            offset += 50
+            if not on_chunk(offset):
+                return {}
+        return {"id": "file-1"}
+
+    monkeypatch.setattr(uploader, "send_from", send_from)
+
+    class MidGate:  # free for the first chunk, then one pause
+        answers = [False, True, False]
+
+        def should_pause(self):
+            return self.answers.pop(0) if self.answers else False
+
+    def sleep(_):
+        os.utime(f, (1, 1))  # the file is edited while uploads wait
+
+    backend = FakeBackend()
+    result = run(job, backend, jobs, gate=MidGate(), sleep=sleep)
+    assert result.startswith("dropped: vod.mp4 changed or moved")
+    assert sends == [0]  # nothing after the pause
+    assert backend.completes == [] and queued(jobs) == []
 
 
 def test_run_job_ready_project_skips_upload(tmp_path, drive):
@@ -526,6 +567,8 @@ def test_main_exits_when_lock_held(app, tmp_path, monkeypatch):
         uploader.unlock(held)
     assert "pystray" not in sys.modules
     assert load_one(app)["path"] == str(clip)  # the running worker takes it
+    [notice] = (app / "notices").glob("*.txt")  # and shows this summary
+    assert notice.read_text(encoding="utf-8") == "clip.mp4: 0:42, clip"
 
 
 def test_main_without_secret_returns_1(app, monkeypatch):
@@ -596,3 +639,90 @@ def test_main_bad_secret_notifies(app, tmp_path, monkeypatch):
     assert uploader.main(["--resume"]) == 0
     assert notes == ["The agent secret is wrong - check agent_config.json"]
     assert len(queued(app)) == 1  # kept for after the secret is fixed
+
+
+def tray(monkeypatch, notes, Icon=None):
+    mod, FakeIcon = fake_pystray(notes)
+    mod.Icon, mod.Menu, mod.MenuItem = Icon or FakeIcon, lambda *a: a, lambda *a: a
+    monkeypatch.setitem(sys.modules, "pystray", mod)
+    monkeypatch.setattr(uploader, "_icon_image", lambda: None)
+    monkeypatch.setattr(uploader, "NOTIFY_LINGER_SECONDS", 0)
+    return FakeIcon
+
+
+def test_notices_left_by_losers_are_shown_and_deleted_by_the_worker(app, tmp_path, monkeypatch):
+    uploader._post_notice(["a.mp4: 0:10, clip"], app)  # a loser, while nobody worked
+    uploader._post_notice(["b.mp4 is empty"], app)
+    notes = []
+    tray(monkeypatch, notes)
+    assert uploader.main(["--resume"]) == 0  # no jobs, but notices: next run shows them
+    assert notes == ["a.mp4: 0:10, clip\nb.mp4 is empty"]
+    assert list((app / "notices").glob("*")) == []
+
+
+def test_main_backend_too_old_notifies_and_keeps_job(app, tmp_path, monkeypatch):
+    notes = []
+    tray(monkeypatch, notes)
+
+    def old(*a, **k):
+        raise uploader.BackendTooOld("The Mac Mini backend needs updating before the uploader can work", 401)
+
+    monkeypatch.setattr(uploader, "run_job", old)
+    uploader.enqueue([str(make_file(tmp_path))], app, lambda p: None)
+    assert uploader.main(["--resume"]) == 0
+    assert notes == ["The Mac Mini backend needs updating before the uploader can work"]
+    assert len(queued(app)) == 1
+
+
+def test_main_tray_failure_never_drops_a_job(app, tmp_path, monkeypatch):
+    notes = []
+    Base = tray(monkeypatch, notes)
+
+    class BrokenIcon(Base):
+        def __setattr__(self, k, v):
+            if k == "title" and hasattr(self, "stopped"):
+                raise ValueError("string too long")
+            super().__setattr__(k, v)
+
+    tray(monkeypatch, notes, BrokenIcon)
+    seen = []
+
+    def job_with_progress(job, backend, http, gate, progress, *a, jobs_dir, **k):
+        progress("vod.mp4", 50, 100)
+        progress("vod.mp4", 50, 100, paused=True)
+        uploader._forget(job, jobs_dir)
+        seen.append(job["job_id"])
+        return "done"
+
+    monkeypatch.setattr(uploader, "run_job", job_with_progress)
+    uploader.enqueue([str(make_file(tmp_path))], app, lambda p: None)
+    assert uploader.main(["--resume"]) == 0
+    assert len(seen) == 1 and queued(app) == [] and notes == []
+
+
+def test_fit_cuts_by_utf16_units_without_splitting_pairs():
+    assert uploader._fit("short", 128) == "short"
+    cut = uploader._fit("😀" * 64, 128)  # 128 units: one too many with the terminator
+    assert cut == "😀" * 63
+    cut = uploader._fit("a" + "😀" * 200, 256)
+    assert len(cut.encode("utf-16-le")) // 2 <= 255
+    cut.encode("utf-16-le")  # no lone surrogate (strict encode would raise)
+
+
+def test_main_tray_failure_before_drain_still_releases_lock(app, tmp_path, monkeypatch):
+    notes = []
+    Base = tray(monkeypatch, notes)
+
+    class NoShow(Base):
+        def __setattr__(self, k, v):
+            if k == "visible":
+                raise OSError("no tray")
+            super().__setattr__(k, v)
+
+    tray(monkeypatch, notes, NoShow)
+    uploader.enqueue([str(make_file(tmp_path))], app, lambda p: None)
+    assert uploader.main(["--resume"]) == 0
+    held = uploader.try_lock(app)
+    assert held is not None  # not left locked for ever
+    uploader.unlock(held)
+    assert len(queued(app)) == 1

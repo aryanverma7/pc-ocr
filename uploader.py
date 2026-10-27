@@ -182,6 +182,13 @@ class BadSecret(Refused):
     """401: every job would fail the same way, so the worker stops."""
 
 
+class BackendTooOld(BadSecret):
+    """A 401 that is not the uploader routes' own: the Mac Mini predates them."""
+
+
+SECRET_REFUSED = "Invalid or missing agent secret"  # uploader_api.py's own 401 text
+
+
 def _gb(n) -> str:
     return f"{n / 1e9:.1f} GB"
 
@@ -203,7 +210,10 @@ class Backend:
             data = {}
         msg = data.get("error") or f"the backend refused it ({resp.status_code})"
         if resp.status_code == 401:
-            raise BadSecret("the agent secret does not match the Mac Mini's", 401)
+            if data.get("error") == SECRET_REFUSED:
+                raise BadSecret("the agent secret does not match the Mac Mini's", 401)
+            # e.g. the auth middleware's "Not authenticated": the route is not in OPEN_PATHS
+            raise BackendTooOld("The Mac Mini backend needs updating before the uploader can work", 401)
         if resp.status_code == 507 and "needed" in data and "free" in data:
             msg = f"Drive is too full for {name}: needs {_gb(data['needed'])}, {_gb(data['free'])} free"
         raise Refused(msg, resp.status_code)
@@ -280,11 +290,15 @@ def run_job(job, backend, http, gate, progress, sleep=time.sleep, stop=lambda: F
         if offset > up["best"]:  # progress made: the line is working again
             up["best"], up["attempt"] = offset, 0
         progress(name, offset, size)
+        paused = False
         while gate.should_pause():
+            paused = True
             progress(name, offset, size, paused=True)
             if stop():
                 return False
             sleep(RECHECK_SECONDS)
+        if paused and not unchanged():  # edited while we waited: send no more of it
+            raise _Changed()
         return not stop()
 
     def upload():
@@ -387,6 +401,42 @@ def base_url(backend_url: str) -> str:
     return f"{u.scheme}://{u.netloc}"
 
 
+def _post_notice(lines, jobs_dir) -> None:
+    """Leave lines for whichever process holds the tray (maybe a later one)."""
+    d = Path(jobs_dir) / "notices"
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{uuid.uuid4().hex}.txt"
+    tmp = path.with_name(f".{path.name}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _notices(jobs_dir) -> list:
+    return sorted((Path(jobs_dir) / "notices").glob("*.txt"), key=lambda p: p.stat().st_mtime)
+
+
+def _take_notices(jobs_dir) -> list:
+    texts = []
+    for p in _notices(jobs_dir):
+        try:
+            texts.append(p.read_text(encoding="utf-8"))
+            p.unlink()
+        except OSError:
+            continue  # taken by another pass, or locked for a moment: next pass
+    return texts
+
+
+def _fit(text, n) -> str:
+    """Fit Windows' WCHAR[n] (terminator included) without splitting a surrogate pair."""
+    units = text.encode("utf-16-le")
+    if len(units) // 2 < n:
+        return text
+    return units[: 2 * (n - 1)].decode("utf-16-le", errors="ignore")
+
+
 def _setup_logging() -> None:
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
     h = logging.handlers.RotatingFileHandler(JOBS_DIR / "uploader.log", maxBytes=1_000_000,
@@ -428,7 +478,9 @@ def main(argv=None) -> int:
 
         refused = enqueue(files, JOBS_DIR, duration)
         lines = [summary_line(p, d) for p, d in durations.items()] + refused
-    if not files and not _pending(JOBS_DIR):
+        if lines:
+            _post_notice(lines, JOBS_DIR)  # before the lock: the winner shows everyone's
+    if not files and not _pending(JOBS_DIR) and not _notices(JOBS_DIR):
         return 0
     lock_fh = try_lock(JOBS_DIR)
     if lock_fh is None:
@@ -447,22 +499,38 @@ def main(argv=None) -> int:
     stop = threading.Event()
     count = {"n": 0, "total": len(_pending(JOBS_DIR))}
     last_notify = [0.0]
+    checked = [0.0]
 
     def notify(text):
-        icon.notify(text[:255], "Send to editor")
-        last_notify[0] = time.monotonic()
+        try:  # a tray hiccup must never drop a job or stop the drain
+            icon.notify(_fit(text, 256), "Send to editor")
+            last_notify[0] = time.monotonic()
+        except Exception as e:
+            log.warning("tray notification failed (%s)", type(e).__name__)
+
+    def show_notices():
+        checked[0] = time.monotonic()
+        texts = _take_notices(JOBS_DIR)
+        if texts:
+            notify("\n".join(texts))
 
     def progress(name, offset, size, paused=False):
-        pct = int(offset * 100 / size) if size else 100
-        if paused:
-            title = f"Paused while live: {name} {pct}%"
-        else:
-            title = f"Sending to editor: {name} {pct}% ({count['n']} of {count['total']})"
-        icon.title = title[:127]  # Windows' tooltip limit
+        try:
+            pct = int(offset * 100 / size) if size else 100
+            if paused:
+                title = f"Paused while live: {name} {pct}%"
+            else:
+                title = f"Sending to editor: {name} {pct}% ({count['n']} of {count['total']})"
+            icon.title = _fit(title, 128)  # Windows' tooltip limit
+            if time.monotonic() - checked[0] >= 5:
+                show_notices()
+        except Exception as e:
+            log.warning("tray update failed (%s)", type(e).__name__)
 
     def run(job, jobs_dir):
+        show_notices()
         count["n"] += 1
-        count["total"] = max(count["total"], count["n"])
+        count["total"] = max(count["n"], count["n"] - 1 + len(_pending(jobs_dir)))
         result = run_job(job, backend, http, gate, progress, sleep=stop.wait,
                          stop=stop.is_set, jobs_dir=jobs_dir)
         if result.startswith("dropped: "):
@@ -470,21 +538,28 @@ def main(argv=None) -> int:
         return result
 
     def work(icon):
-        icon.visible = True
-        if sys.platform == "win32":
-            import ctypes
-
-            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+        draining = False
         try:
-            if lines:
-                notify("\n".join(lines))
-            drain(JOBS_DIR, lock_fh, run)
+            icon.visible = True
+            if sys.platform == "win32":
+                import ctypes
+
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+            show_notices()
+            draining = True
+            drain(JOBS_DIR, lock_fh, run)  # releases the lock however it ends
+        except BackendTooOld as e:
+            notify(e.message)
         except BadSecret:
             notify("The agent secret is wrong - check agent_config.json")
         except Exception:
             log.exception("uploader stopped unexpectedly")
         finally:
+            if not draining:
+                unlock(lock_fh)
             if sys.platform == "win32":
+                import ctypes
+
                 ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
             stop.wait(max(0.0, last_notify[0] + NOTIFY_LINGER_SECONDS - time.monotonic()))
             icon.stop()
@@ -492,7 +567,7 @@ def main(argv=None) -> int:
     menu = pystray.Menu(pystray.MenuItem("Stop (resumes at next login)",
                                          lambda icon, item: stop.set()))
     icon = pystray.Icon("dualbladex-uploader", _icon_image(), "Send to editor", menu)
-    icon.run(setup=work)  # drain releases the lock however it ends
+    icon.run(setup=work)
     return 0
 
 

@@ -6,8 +6,10 @@ A small icon in the system tray shows progress.
 
 ## One-time setup
 
-1. **Get the new files.** Open a terminal in the agent folder (the one with
-   `agent.py`) and run:
+1. **Update the Mac Mini first.** Its backend update (the uploader routes)
+   must be merged and pulled on the Mac Mini, and the backend restarted, before
+   anything here will work. Then, on this PC, open a terminal in the agent
+   folder (the one with `agent.py`) and run:
 
    ```
    git pull
@@ -28,15 +30,27 @@ A small icon in the system tray shows progress.
    - Click **OK**.
 
 4. **Give the uploader that password.** Open `agent_config.json` in the agent
-   folder and add this line inside the `{ }`, pasting the password you copied:
+   folder. Put a new line **right after the opening `{`** and paste this into
+   it, with your password and **with the comma at the end**:
 
    ```
    "obs_ws_password": "<the password>",
    ```
 
-   Every line except the last one needs a comma at the end. If you changed the
-   OBS port from 4455, add `"obs_ws_port": <your port>,` too; otherwise leave it
-   out. Nothing else is needed: the uploader reuses `backend_url` and
+   Putting it first, with its comma, keeps the file valid whatever comes after.
+   The result looks like this (your other lines stay as they were):
+
+   ```
+   {
+     "obs_ws_password": "abc123XYZ",
+     "backend_url": "https://hub.dualbladex.org/api/ocr/credit-report",
+     "agent_secret": "...",
+     ...
+   }
+   ```
+
+   If you changed the OBS port from 4455, add `"obs_ws_port": <your port>,` on
+   the next line the same way; otherwise leave it out. Nothing else is needed: the uploader reuses `backend_url` and
    `agent_secret`, which are already there for the credit reader.
 
 5. **Add the right-click menu entry:**
@@ -72,9 +86,16 @@ A small icon in the system tray shows progress.
   it and send the files again (or log out and back in; the queue is kept).
 - **"Drive is too full"**: free up space on the editor's Google Drive, then
   send the file again.
-- **Nothing happens on right-click / no "Send to editor" entry**: run
+- **Nothing happens on right-click / no tray icon / no "Send to editor"
+  entry**: first check `agent_config.json` for a missing or extra comma - a
+  broken file stops both the uploader and the credit reader. Then look at the
+  end of `uploads\uploader.log`. If neither explains it, run
   `python install_uploader.py` again (also needed if you move the agent folder
   or reinstall Python).
+- **The tray says "The Mac Mini backend needs updating before the uploader can
+  work"**: the Mac Mini is still on the old backend. Pull the update there and
+  restart the backend (step 1); your files stay queued and go at the next
+  right-click or login.
 - **Uploads don't pause while you are live**: the OBS password is probably
   wrong (redo steps 3 and 4). Until it is fixed the uploader asks the Mac Mini
   instead, which only knows you are live while go-live announcements are
