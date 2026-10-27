@@ -32,6 +32,10 @@ JOBS_DIR = Path(__file__).parent / "uploads"
 _STOPPED = object()
 
 
+class _Changed(Exception):
+    """The file on disk is no longer the one the backend was told about."""
+
+
 def backoff(attempt: int) -> float:
     return min(5 * 2 ** attempt, 300)
 
@@ -75,9 +79,15 @@ def _pending(jobs_dir) -> list:
                 raise ValueError("missing fields")
         except FileNotFoundError:
             continue  # finished by someone else between glob and read
-        except (OSError, ValueError) as e:
-            log.error("unreadable job %s (%s); renamed to .bad", p.name, e)
-            os.replace(p, p.with_name(p.name + ".bad"))
+        except ValueError as e:  # corrupt JSON or missing fields: quarantine it
+            log.error("corrupt job %s (%s); renamed to .bad", p.name, e)
+            try:
+                os.replace(p, p.with_name(p.name + ".bad"))
+            except OSError:
+                pass  # another process already moved it
+            continue
+        except OSError as e:  # e.g. locked by antivirus for a moment: try next pass
+            log.warning("could not read job %s (%s); skipped", p.name, type(e).__name__)
             continue
         jobs.append(job)
     return sorted(jobs, key=lambda j: (j.get("created_at", 0), os.path.basename(j["path"])))
@@ -237,14 +247,18 @@ def run_job(job, backend, http, gate, progress, sleep=time.sleep, stop=lambda: F
         log.info("done %s", name)
         return "done"
 
-    # Never upload different bytes than the backend was told about.
-    try:
-        st = os.stat(path)
-        same = st.st_size == size and st.st_mtime == job["mtime"]
-    except OSError:
-        same = False
-    if not same:
-        return drop(f"{name} changed or moved since it was sent; send it again")
+    changed = f"{name} changed or moved since it was sent; send it again"
+
+    def unchanged():
+        # Never upload different bytes than the backend was told about.
+        try:
+            st = os.stat(path)
+            return st.st_size == size and st.st_mtime == job["mtime"]
+        except OSError:
+            return False
+
+    if not unchanged():
+        return drop(changed)
 
     def register(new_session=False):
         r = _retry(lambda: backend.register(job, new_session=new_session), sleep, stop,
@@ -274,6 +288,8 @@ def run_job(job, backend, http, gate, progress, sleep=time.sleep, stop=lambda: F
             return got  # Google already has every byte
         if not on_chunk(got):
             return {}
+        if not unchanged():  # checked again after any pause and on every retry
+            raise _Changed()
         return send_from(http, job["upload_url"], path, size, got, on_chunk)
 
     try:
@@ -306,6 +322,12 @@ def run_job(job, backend, http, gate, progress, sleep=time.sleep, stop=lambda: F
         raise
     except Refused as e:
         return drop(e.message)
+    except _Changed:
+        return drop(changed)
+    except Exception as e:
+        # Anything else would stall the whole queue on this one job.
+        log.exception("unexpected %s sending %s", type(e).__name__, name)
+        return drop(f"{name} could not be sent ({type(e).__name__}); send it again")
 
 
 def drain(jobs_dir, lock_fh, run, after_unlock=lambda: None) -> list:

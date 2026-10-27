@@ -426,3 +426,72 @@ def test_drain_stops_on_stopped(tmp_path):
     assert uploader.drain(jobs, uploader.try_lock(jobs), lambda job, jobs_dir: "stopped") \
         == ["stopped"]
     assert len(queued(jobs)) == 1
+
+
+# --- review fixes ------------------------------------------------------------
+
+def test_run_job_drops_when_file_changes_during_gate_pause(tmp_path, drive):
+    f, jobs, job = enqueue_one(tmp_path)
+
+    def sleep(seconds):  # the streamer trims the file while the stream runs
+        os.utime(f, (job["mtime"] + 60, job["mtime"] + 60))
+
+    result = run(job, FakeBackend(), jobs, gate=Gate(pauses=1), sleep=sleep)
+    assert result == "dropped: vod.mp4 changed or moved since it was sent; send it again"
+    assert drive["sends"] == []
+    assert queued(jobs) == []
+
+
+def test_run_job_rechecks_file_before_retrying(tmp_path, drive, monkeypatch):
+    f, jobs, job = enqueue_one(tmp_path)
+    sends = []
+
+    def send_from(http, url, path, total, offset, on_chunk):
+        sends.append(offset)
+        f.unlink()
+        raise requests.ConnectionError("x")
+
+    monkeypatch.setattr(uploader, "send_from", send_from)
+    assert run(job, FakeBackend(), jobs).startswith("dropped: vod.mp4 changed or moved")
+    assert sends == [0]
+
+
+def test_run_job_unexpected_error_drops_instead_of_stalling(tmp_path, drive, monkeypatch):
+    f, jobs, job = enqueue_one(tmp_path)
+
+    def send_from(*a):
+        raise RuntimeError("unexpected status 418")
+
+    monkeypatch.setattr(uploader, "send_from", send_from)
+    assert run(job, FakeBackend(), jobs) == \
+        "dropped: vod.mp4 could not be sent (RuntimeError); send it again"
+    assert queued(jobs) == []
+
+
+def test_pending_skips_unreadable_job_without_quarantining(tmp_path, monkeypatch):
+    jobs = tmp_path / "uploads"
+    uploader.enqueue([str(make_file(tmp_path))], jobs_dir=jobs, duration=lambda p: None)
+    real = uploader.Path.read_text
+
+    def locked(self, *a, **k):
+        if self.suffix == ".json":
+            raise PermissionError("antivirus")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(uploader.Path, "read_text", locked)
+    assert uploader._pending(jobs) == []
+    monkeypatch.setattr(uploader.Path, "read_text", real)
+    assert len(queued(jobs)) == 1 and not list(jobs.glob("*.bad"))
+    assert len(uploader._pending(jobs)) == 1
+
+
+def test_pending_tolerates_bad_job_already_renamed(tmp_path, monkeypatch):
+    jobs = tmp_path / "uploads"
+    jobs.mkdir()
+    (jobs / "broken.json").write_text("{not json")
+
+    def gone(src, dst):
+        raise FileNotFoundError(src)  # another process quarantined it first
+
+    monkeypatch.setattr(uploader.os, "replace", gone)
+    assert uploader._pending(jobs) == []
