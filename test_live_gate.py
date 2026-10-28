@@ -1,8 +1,5 @@
-import sys
-import types
-
 import live_gate
-from live_gate import LiveGate, backend_live_from, obs_streaming_from
+from live_gate import LiveGate, backend_live_from
 
 
 class Clock:
@@ -25,26 +22,26 @@ class Answers:
         return self.value
 
 
-def make(obs=None, backend=None):
+def make(live=None):
     clock = Clock()
-    obs, backend = Answers(obs), Answers(backend)
-    return LiveGate(obs, backend, clock), obs, backend, clock
+    ask = Answers(live)
+    return LiveGate(ask, clock), ask, clock
 
 
 def test_not_live_does_not_pause():
-    gate, *_ = make(obs=False)
+    gate, *_ = make(live=False)
     assert gate.should_pause() is False
 
 
-def test_obs_streaming_pauses():
-    gate, *_ = make(obs=True)
+def test_live_pauses():
+    gate, *_ = make(live=True)
     assert gate.should_pause() is True
 
 
 def test_resumes_only_300s_after_stream_ends():
-    gate, obs, _, clock = make(obs=True)
+    gate, ask, clock = make(live=True)
     assert gate.should_pause()
-    obs.value = False
+    ask.value = False
     clock.t = 30
     assert gate.should_pause()  # first offline answer, still inside the grace
     clock.t = 299
@@ -53,58 +50,20 @@ def test_resumes_only_300s_after_stream_ends():
     assert not gate.should_pause()
 
 
-def test_obs_unreachable_falls_back_to_backend():
-    gate, _, backend, _ = make(obs=None, backend=True)
-    assert gate.should_pause() is True
-    assert backend.calls == 1
-
-
-def test_neither_answers_means_upload():
-    gate, *_ = make(obs=None, backend=None)
+def test_no_answer_means_upload():
+    gate, *_ = make(live=None)
     assert gate.should_pause() is False
-
-
-def test_backend_not_asked_when_obs_answers():
-    gate, _, backend, _ = make(obs=False, backend=True)
-    assert gate.should_pause() is False
-    assert backend.calls == 0
 
 
 def test_checks_at_most_every_30s():
-    gate, obs, _, clock = make(obs=False)
+    gate, ask, clock = make(live=False)
     gate.should_pause()
     clock.t = 29
     gate.should_pause()
-    assert obs.calls == 1
+    assert ask.calls == 1
     clock.t = 30
     gate.should_pause()
-    assert obs.calls == 2
-
-
-def test_obs_streaming_from_returns_none_on_error(monkeypatch):
-    def boom(**kw):
-        raise ConnectionRefusedError
-
-    monkeypatch.setitem(sys.modules, "obsws_python", types.SimpleNamespace(ReqClient=boom))
-    assert obs_streaming_from({})() is None
-
-
-def test_obs_streaming_from_reads_output_active_and_disconnects(monkeypatch):
-    seen = {}
-
-    class Client:
-        def __init__(self, **kw):
-            seen.update(kw)
-
-        def get_stream_status(self):
-            return types.SimpleNamespace(output_active=True)
-
-        def disconnect(self):
-            seen["closed"] = True
-
-    monkeypatch.setitem(sys.modules, "obsws_python", types.SimpleNamespace(ReqClient=Client))
-    assert obs_streaming_from({"obs_ws_password": "pw"})() is True
-    assert seen == {"host": "localhost", "port": 4455, "password": "pw", "timeout": 3, "closed": True}
+    assert ask.calls == 2
 
 
 class Resp:

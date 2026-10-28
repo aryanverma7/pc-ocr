@@ -28,7 +28,7 @@ from urllib.parse import urlsplit
 import requests
 
 from drive_upload import SessionExpired, query_offset, send_from
-from live_gate import RECHECK_SECONDS, LiveGate, backend_live_from, obs_streaming_from
+from live_gate import RECHECK_SECONDS, LiveGate, backend_live_from
 from region import load_config
 
 log = logging.getLogger("uploader")
@@ -495,7 +495,7 @@ def main(argv=None) -> int:
 
     http = requests.Session()
     backend = Backend(base, secret, http)
-    gate = LiveGate(obs_streaming_from(cfg), backend_live_from(base, secret, http))
+    gate = LiveGate(backend_live_from(base, secret, http))
     stop = threading.Event()
     count = {"n": 0, "total": len(_pending(JOBS_DIR))}
     last_notify = [0.0]

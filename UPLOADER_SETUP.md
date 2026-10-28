@@ -21,45 +21,13 @@ A small icon in the system tray shows progress.
    pip install -r requirements.txt
    ```
 
-3. **Let the uploader ask OBS whether you are live**, so it never slows your
-   stream down. In OBS: **Tools -> WebSocket Server Settings**.
-   - Tick **Enable WebSocket server**.
-   - Leave the port at **4455**.
-   - Tick **Enable Authentication**.
-   - Click **Show Connect Info** and copy the **Server Password**.
-   - Click **OK**.
-
-4. **Give the uploader that password.** Open `agent_config.json` in the agent
-   folder. Put a new line **right after the opening `{`** and paste this into
-   it, with your password and **with the comma at the end**:
-
-   ```
-   "obs_ws_password": "<the password>",
-   ```
-
-   Putting it first, with its comma, keeps the file valid whatever comes after.
-   The result looks like this (your other lines stay as they were):
-
-   ```
-   {
-     "obs_ws_password": "abc123XYZ",
-     "backend_url": "https://hub.dualbladex.org/api/ocr/credit-report",
-     "agent_secret": "...",
-     ...
-   }
-   ```
-
-   If you changed the OBS port from 4455, add `"obs_ws_port": <your port>,` on
-   the next line the same way; otherwise leave it out. Nothing else is needed: the uploader reuses `backend_url` and
-   `agent_secret`, which are already there for the credit reader.
-
-5. **Add the right-click menu entry:**
+3. **Add the right-click menu entry:**
 
    ```
    python install_uploader.py
    ```
 
-6. **Try it with one short clip.** Right-click a clip under 5 minutes and
+4. **Try it with one short clip.** Right-click a clip under 5 minutes and
    choose **Send to editor** (on Windows 11 it is under **Show more options**).
    The tray icon should appear, tell you the clip's length and that it is a
    clip, and disappear when it has been sent.
@@ -70,8 +38,11 @@ A small icon in the system tray shows progress.
   right-click for more). Each file becomes its own project for the editor.
 - Anything **under 5 minutes is a clip**, anything longer is a VOD.
 - Hover over the tray icon to see what is sending and how far along it is.
-- **While OBS is streaming, uploads pause** so your stream keeps all the
-  bandwidth. They carry on 5 minutes after you stop streaming.
+- **While you are live on Twitch, uploads pause** so your stream keeps all the
+  bandwidth. They carry on 5 minutes after you stop streaming. (The Mac Mini
+  checks Twitch, so this needs the Twitch channel and app keys set in the
+  dashboard, which the go-live announcer already uses. Twitch can take a minute
+  or so to show you as live, so an upload may run for the first minute.)
 - To stop early, right-click the tray icon and choose **Stop (resumes at next
   login)**. Nothing is lost.
 - After a **power cut or restart**, unfinished uploads carry on by themselves
@@ -96,8 +67,7 @@ A small icon in the system tray shows progress.
   work"**: the Mac Mini is still on the old backend. Pull the update there and
   restart the backend (step 1); your files stay queued and go at the next
   right-click or login.
-- **Uploads don't pause while you are live**: the OBS password is probably
-  wrong (redo steps 3 and 4). Until it is fixed the uploader asks the Mac Mini
-  instead, which only knows you are live while go-live announcements are
-  switched on; otherwise it just uploads.
+- **Uploads don't pause while you are live**: check the Twitch channel, client
+  ID and client secret in the dashboard's Settings, and the end of
+  `uploads\uploader.log`. If the Mac Mini can't reach Twitch, it uploads anyway.
 - **Anything else**: look at the end of `uploads\uploader.log`.
