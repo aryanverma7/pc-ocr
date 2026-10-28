@@ -33,3 +33,5 @@ desktop.ini
 # Editor
 .vscode/
 .idea/
+# Uploader job files (they hold upload session URLs) and its log
+uploads/
