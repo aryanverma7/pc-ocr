@@ -502,22 +502,56 @@ class TestMainLoopFixes:
         assert agent.try_grab({"left": 0, "top": 0, "width": 10, "height": 10}) is None
 
     def test_a_capture_never_pairs_a_new_generation_with_the_old_phase(self):
+        import threading, time
+        from burst_timer import BurstTimer
+
         phase = agent.BuyPhase()
         seen = []
 
-        class Burst:
-            generation = 0
+        class SlowBurst(BurstTimer):
+            t = None
 
             def trigger(self):
-                self.generation += 1  # like BurstTimer: bumped before trigger returns
-                import threading, time
-                t = threading.Thread(target=lambda: seen.append(phase.snapshot(self)))
-                t.start()
+                new = super().trigger()  # the real generation bump
+                self.t = threading.Thread(target=lambda: seen.append(phase.snapshot(self)))
+                self.t.start()
                 time.sleep(0.1)  # the main loop reads mid-press
-                self.t = t
-                return True
+                return new
 
-        b = Burst()
+        b = SlowBurst(duration_seconds=6)
         assert phase.press(b) is True
         b.t.join()
-        assert seen == [(1, 1)]
+        assert seen == [(b.generation, 1)]
+
+    def test_a_failed_grab_in_the_main_loop_releases_its_pending_slot(self):
+        calls = []
+        hooks = {}
+        kb = MagicMock()
+        kb.on_press_key.side_effect = lambda key, cb: hooks.setdefault(key, cb)
+
+        def grab(region):
+            calls.append(1)
+            return None
+
+        sleeps = []
+
+        def sleep(_):
+            sleeps.append(1)
+            if not calls and "b" in hooks and not hooks.get("pressed"):
+                hooks["pressed"] = True
+                hooks["b"](None)
+            # The sleep cap turns a leaked slot into a failure instead of a hang.
+            if len(calls) > agent.MAX_PENDING_CAPTURES + 10 or len(sleeps) > 2000:
+                raise KeyboardInterrupt
+
+        with patch("agent.load_config", return_value=make_config()), \
+             patch("agent.is_calibrated", return_value=True), \
+             patch("agent.keyboard", kb), \
+             patch("agent.heartbeat_loop"), \
+             patch("agent.reset_history"), \
+             patch("agent.try_grab", grab), \
+             patch("agent.CAPTURE_INTERVAL_WITHIN_BURST", 0), \
+             patch("agent.time.sleep", sleep):
+            agent.main()
+        # A leaked slot per failed grab would saturate at MAX_PENDING_CAPTURES and stop grabbing.
+        assert len(calls) > agent.MAX_PENDING_CAPTURES

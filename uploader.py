@@ -115,6 +115,15 @@ def _pending(jobs_dir) -> list:
     return sorted(jobs, key=lambda j: (j.get("created_at", 0), os.path.basename(j["path"])))
 
 
+def _started_at(st) -> float:
+    """When the file was created, so a stream crossing midnight is filed under its start date."""
+    birth = getattr(st, "st_birthtime", None)
+    if birth is None:
+        birth = st.st_ctime if os.name == "nt" else st.st_mtime  # Linux ctime is inode change, not creation
+    # A copy to another drive gets a new creation time but keeps the modified time.
+    return min(birth, st.st_mtime)
+
+
 def enqueue(paths, jobs_dir=JOBS_DIR, duration=media_duration) -> list:
     """Queue each file; returns messages for the ones refused."""
     Path(jobs_dir).mkdir(parents=True, exist_ok=True)
@@ -140,11 +149,15 @@ def enqueue(paths, jobs_dir=JOBS_DIR, duration=media_duration) -> list:
             "size": st.st_size,
             "mtime": st.st_mtime,
             "duration_s": duration(path),
-            "stream_date": datetime.date.fromtimestamp(st.st_mtime).isoformat(),
+            "stream_date": datetime.date.fromtimestamp(_started_at(st)).isoformat(),
             "mime": mimetypes.guess_type(path)[0] or "video/mp4",
             "created_at": time.time(),
         }
-        _save(job, jobs_dir)
+        try:
+            _save(job, jobs_dir)
+        except OSError:  # not queued: say so, or the file silently never arrives
+            refused.append(f"{name} could not be queued (its job file is locked); send it again")
+            continue
         have.add((path, st.st_size, st.st_mtime))
         log.info("queued %s (%d bytes)", name, st.st_size)
     return refused
@@ -249,6 +262,19 @@ class Backend:
 
 # --- the worker ---------------------------------------------------------------
 
+RATE_LIMIT_REASONS = {"rateLimitExceeded", "userRateLimitExceeded"}
+
+
+def _rate_limited(resp) -> bool:
+    """Google answers a throttled upload with 403 + one of these reasons: wait, don't give up."""
+    try:
+        err = resp.json().get("error", {})
+        reasons = {e.get("reason") for e in err.get("errors", [])}
+        reasons.add(err.get("status"))
+        return bool(reasons & RATE_LIMIT_REASONS)
+    except Exception:
+        return False
+
 def _retry(step, sleep, stop, state):
     """Run step until it stops raising temporary errors; _STOPPED if told to stop."""
     while True:
@@ -257,7 +283,8 @@ def _retry(step, sleep, stop, state):
         except requests.RequestException as e:
             # Exception text can carry the upload URL: log only the kind and status.
             status = getattr(getattr(e, "response", None), "status_code", None)
-            if status is not None and 400 <= status < 500 and status not in (408, 429):
+            if status is not None and 400 <= status < 500 and status not in (408, 429) \
+                    and not _rate_limited(e.response):
                 # Permanent (e.g. 403 storageQuotaExceeded): retrying forever helps nobody.
                 raise Refused(f"Upload to Drive failed: {status} {getattr(e.response, 'reason', '') or ''}".strip(),
                               status) from None
@@ -296,13 +323,24 @@ def run_job(job, backend, http, gate, progress, sleep=time.sleep, stop=lambda: F
     if not unchanged():
         return drop(changed)
 
+    unsaved = [False]
+
+    def save():
+        # Never drop a job for its own file: the job lives in memory; retry the save later.
+        try:
+            _save(job, jobs_dir)
+            unsaved[0] = False
+        except OSError as e:
+            unsaved[0] = True
+            log.warning("could not save job file (%s); will retry", type(e).__name__)
+
     def register(new_session=False):
         r = _retry(lambda: backend.register(job, new_session=new_session), sleep, stop,
                    {"attempt": 0})
         if r is _STOPPED or r["status"] == "ready":
             return r
         job.update(project_id=r["project_id"], upload_url=r["upload_url"])
-        _save(job, jobs_dir)
+        save()
         return r
 
     up = {"attempt": 0, "best": -1}
@@ -311,6 +349,8 @@ def run_job(job, backend, http, gate, progress, sleep=time.sleep, stop=lambda: F
         if offset > up["best"]:  # progress made: the line is working again
             up["best"], up["attempt"] = offset, 0
         progress(name, offset, size)
+        if unsaved[0]:
+            save()
         paused = False
         while gate.should_pause():
             paused = True

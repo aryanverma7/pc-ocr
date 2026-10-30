@@ -789,3 +789,105 @@ def test_forget_survives_a_locked_file(tmp_path, monkeypatch):
     monkeypatch.setattr(uploader.Path, "unlink", locked)
     uploader._forget(job, jobs)  # must not raise
     assert len(queued(jobs)) == 1
+
+
+# --- later batch ---------------------------------------------------------------------
+
+def test_google_403_rate_limit_is_retried_not_final(tmp_path, monkeypatch):
+    f, jobs, job = enqueue_one(tmp_path)
+    r = resp(403, {"error": {"errors": [{"reason": "userRateLimitExceeded"}], "code": 403}})
+    calls = []
+
+    def query_offset(http, url, total):
+        calls.append(1)
+        if len(calls) == 1:
+            raise requests.HTTPError("403", response=r)
+        return {"id": "file-1"}
+
+    monkeypatch.setattr(uploader, "query_offset", query_offset)
+    job.update(project_id="p1", upload_url="https://upload/1")
+    sleep = Recorder()
+    assert run(job, FakeBackend(), jobs, sleep=sleep) == "done"
+    assert len(sleep.calls) == 1  # backed off once
+
+
+def test_a_job_file_locked_past_the_retries_stays_in_memory_and_is_saved_later(tmp_path, monkeypatch, drive):
+    f, jobs, job = enqueue_one(tmp_path)
+    monkeypatch.setattr(uploader, "_io_sleep", lambda s: None)
+    real = os.replace
+    locked = [True]
+
+    def replace(a, b):
+        if locked[0]:
+            raise PermissionError("locked")
+        return real(a, b)
+
+    monkeypatch.setattr(os, "replace", replace)
+    seen = []
+
+    def progress(name, offset, size, paused=False):
+        seen.append(load_one(jobs).get("project_id"))
+        locked[0] = False  # the antivirus let go
+
+    result = run(job, FakeBackend(), jobs, progress=progress)
+    assert result == "done"  # not dropped
+    assert seen[0] is None and seen[-1] == "p1"
+    assert job["project_id"] == "p1"
+
+
+def test_save_is_retried_on_the_next_chunk(tmp_path, monkeypatch, drive):
+    f, jobs, job = enqueue_one(tmp_path)
+    monkeypatch.setattr(uploader, "_io_sleep", lambda s: None)
+    real = uploader._save
+    fails = [1]
+
+    def save(j, d):
+        if fails[0]:
+            fails[0] -= 1
+            raise PermissionError("locked")
+        return real(j, d)
+
+    monkeypatch.setattr(uploader, "_save", save)
+    on_disk = []
+    run(job, FakeBackend(), jobs, progress=lambda *a, **k: on_disk.append(load_one(jobs).get("project_id")))
+    assert on_disk[-1] == "p1"
+
+
+def test_stream_date_is_the_creation_date_not_the_modified_date(tmp_path, monkeypatch):
+    f = make_file(tmp_path)
+    birth = datetime.datetime(2026, 10, 26, 22, 0).timestamp()
+    os.utime(f, (birth + 7200, birth + 7200))  # modified after midnight
+    monkeypatch.setattr(uploader, "_started_at", lambda st: birth)
+    jobs = tmp_path / "uploads"
+    uploader.enqueue([str(f)], jobs_dir=jobs, duration=lambda p: 1.0)
+    assert load_one(jobs)["stream_date"] == "2026-10-26"
+
+
+def test_started_at_prefers_birthtime_then_platform_fallback():
+    st = type("St", (), {"st_mtime": 5.0, "st_ctime": 3.0, "st_birthtime": 1.0})()
+    assert uploader._started_at(st) == 1.0
+    st = type("St", (), {"st_mtime": 5.0, "st_ctime": 3.0})()
+    assert uploader._started_at(st) == (3.0 if os.name == "nt" else 5.0)
+
+
+def test_a_copied_file_keeps_its_recording_date_not_the_copy_date():
+    # Copying to another drive gives a new creation time but keeps the modified time:
+    # a creation time after the modified time is the copy, not the stream start.
+    st = type("St", (), {"st_mtime": 5.0, "st_ctime": 9.0, "st_birthtime": 9.0})()
+    assert uploader._started_at(st) == 5.0
+
+
+def test_a_job_file_that_cannot_be_written_is_reported_and_the_rest_still_queue(tmp_path, monkeypatch):
+    a, b = make_file(tmp_path, "a.mp4"), make_file(tmp_path, "b.mp4")
+    real = uploader._save
+
+    def save(job, d):
+        if job["path"].endswith("a.mp4"):
+            raise PermissionError("locked")
+        return real(job, d)
+
+    monkeypatch.setattr(uploader, "_save", save)
+    jobs = tmp_path / "uploads"
+    refused = uploader.enqueue([str(a), str(b)], jobs_dir=jobs, duration=lambda p: 1.0)
+    assert refused == ["a.mp4 could not be queued (its job file is locked); send it again"]
+    assert load_one(jobs)["path"].endswith("b.mp4")
