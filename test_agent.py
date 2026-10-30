@@ -32,17 +32,15 @@ class TestCaptureAndSend:
     @patch("agent.requests.post")
     @patch("agent.ImageGrab.grab")
     def test_sends_a_correctly_sized_crop_matching_the_calibrated_region(self, mock_grab, mock_post):
-        mock_grab.return_value = Image.new("RGB", (1920, 1080))
+        # grab_region hands the bbox to ImageGrab, so the mock returns a bbox-sized image.
+        mock_grab.return_value = Image.new("RGB", (150, 45))
         mock_post.return_value = MagicMock(status_code=200, json=lambda: {"credits": 4900})
 
         agent.capture_and_send(make_config(region={"left": 0, "top": 0, "width": 150, "height": 45}))
 
-        sent_bytes = mock_post.call_args.kwargs["data"]
-        # Confirms the actual PNG bytes sent decode back to the exact
-        # calibrated dimensions, not just that SOME data was sent.
+        assert mock_grab.call_args.kwargs["bbox"] == (0, 0, 150, 45)
         from io import BytesIO
-        sent_image = Image.open(BytesIO(sent_bytes))
-        assert sent_image.size == (150, 45)
+        assert Image.open(BytesIO(mock_post.call_args.kwargs["data"])).size == (150, 45)
 
     @patch("agent.requests.post")
     @patch("agent.ImageGrab.grab")
@@ -496,3 +494,30 @@ class TestHeartbeat:
         # to leave room for two dropped pings before the dashboard reports
         # the agent dead.
         assert agent.HEARTBEAT_INTERVAL_SECONDS * 3 <= 45
+
+
+class TestMainLoopFixes:
+    @patch("agent.ImageGrab.grab", side_effect=OSError("screen grab failed"))
+    def test_a_refused_screen_grab_is_none_not_a_crash(self, _grab):
+        assert agent.try_grab({"left": 0, "top": 0, "width": 10, "height": 10}) is None
+
+    def test_a_capture_never_pairs_a_new_generation_with_the_old_phase(self):
+        phase = agent.BuyPhase()
+        seen = []
+
+        class Burst:
+            generation = 0
+
+            def trigger(self):
+                self.generation += 1  # like BurstTimer: bumped before trigger returns
+                import threading, time
+                t = threading.Thread(target=lambda: seen.append(phase.snapshot(self)))
+                t.start()
+                time.sleep(0.1)  # the main loop reads mid-press
+                self.t = t
+                return True
+
+        b = Burst()
+        assert phase.press(b) is True
+        b.t.join()
+        assert seen == [(1, 1)]
