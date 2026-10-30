@@ -153,7 +153,11 @@ def enqueue(paths, jobs_dir=JOBS_DIR, duration=media_duration) -> list:
             "mime": mimetypes.guess_type(path)[0] or "video/mp4",
             "created_at": time.time(),
         }
-        _save(job, jobs_dir)
+        try:
+            _save(job, jobs_dir)
+        except OSError:  # not queued: say so, or the file silently never arrives
+            refused.append(f"{name} could not be queued (its job file is locked); send it again")
+            continue
         have.add((path, st.st_size, st.st_mtime))
         log.info("queued %s (%d bytes)", name, st.st_size)
     return refused

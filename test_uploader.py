@@ -875,3 +875,19 @@ def test_a_copied_file_keeps_its_recording_date_not_the_copy_date():
     # a creation time after the modified time is the copy, not the stream start.
     st = type("St", (), {"st_mtime": 5.0, "st_ctime": 9.0, "st_birthtime": 9.0})()
     assert uploader._started_at(st) == 5.0
+
+
+def test_a_job_file_that_cannot_be_written_is_reported_and_the_rest_still_queue(tmp_path, monkeypatch):
+    a, b = make_file(tmp_path, "a.mp4"), make_file(tmp_path, "b.mp4")
+    real = uploader._save
+
+    def save(job, d):
+        if job["path"].endswith("a.mp4"):
+            raise PermissionError("locked")
+        return real(job, d)
+
+    monkeypatch.setattr(uploader, "_save", save)
+    jobs = tmp_path / "uploads"
+    refused = uploader.enqueue([str(a), str(b)], jobs_dir=jobs, duration=lambda p: 1.0)
+    assert refused == ["a.mp4 could not be queued (its job file is locked); send it again"]
+    assert load_one(jobs)["path"].endswith("b.mp4")
