@@ -868,3 +868,10 @@ def test_started_at_prefers_birthtime_then_platform_fallback():
     assert uploader._started_at(st) == 1.0
     st = type("St", (), {"st_mtime": 5.0, "st_ctime": 3.0})()
     assert uploader._started_at(st) == (3.0 if os.name == "nt" else 5.0)
+
+
+def test_a_copied_file_keeps_its_recording_date_not_the_copy_date():
+    # Copying to another drive gives a new creation time but keeps the modified time:
+    # a creation time after the modified time is the copy, not the stream start.
+    st = type("St", (), {"st_mtime": 5.0, "st_ctime": 9.0, "st_birthtime": 9.0})()
+    assert uploader._started_at(st) == 5.0

@@ -118,9 +118,10 @@ def _pending(jobs_dir) -> list:
 def _started_at(st) -> float:
     """When the file was created, so a stream crossing midnight is filed under its start date."""
     birth = getattr(st, "st_birthtime", None)
-    if birth is not None:
-        return birth
-    return st.st_ctime if os.name == "nt" else st.st_mtime  # Linux ctime is inode change, not creation
+    if birth is None:
+        birth = st.st_ctime if os.name == "nt" else st.st_mtime  # Linux ctime is inode change, not creation
+    # A copy to another drive gets a new creation time but keeps the modified time.
+    return min(birth, st.st_mtime)
 
 
 def enqueue(paths, jobs_dir=JOBS_DIR, duration=media_duration) -> list:
