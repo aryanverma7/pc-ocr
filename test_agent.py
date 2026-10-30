@@ -533,11 +533,15 @@ class TestMainLoopFixes:
             calls.append(1)
             return None
 
+        sleeps = []
+
         def sleep(_):
+            sleeps.append(1)
             if not calls and "b" in hooks and not hooks.get("pressed"):
                 hooks["pressed"] = True
                 hooks["b"](None)
-            if len(calls) > agent.MAX_PENDING_CAPTURES + 10:
+            # The sleep cap turns a leaked slot into a failure instead of a hang.
+            if len(calls) > agent.MAX_PENDING_CAPTURES + 10 or len(sleeps) > 2000:
                 raise KeyboardInterrupt
 
         with patch("agent.load_config", return_value=make_config()), \
