@@ -726,3 +726,66 @@ def test_main_tray_failure_before_drain_still_releases_lock(app, tmp_path, monke
     assert held is not None  # not left locked for ever
     uploader.unlock(held)
     assert len(queued(app)) == 1
+
+
+# --- audit fixes -----------------------------------------------------------------
+
+def test_permanent_google_4xx_drops_the_job_with_a_message(tmp_path, monkeypatch):
+    f, jobs, job = enqueue_one(tmp_path)
+    r = resp(403, {})
+    r.reason = "Forbidden"
+
+    def query_offset(http, url, total):
+        raise requests.HTTPError("403", response=r)
+
+    monkeypatch.setattr(uploader, "query_offset", query_offset)
+    job.update(project_id="p1", upload_url="https://upload/1")
+    sleep = Recorder()
+    assert run(job, FakeBackend(), jobs, sleep=sleep) == "dropped: Upload to Drive failed: 403 Forbidden"
+    assert sleep.calls == [] and queued(jobs) == []
+
+
+def test_google_429_is_still_retried(tmp_path, monkeypatch):
+    f, jobs, job = enqueue_one(tmp_path)
+    r = resp(429, {})
+    calls = []
+
+    def query_offset(http, url, total):
+        calls.append(1)
+        if len(calls) == 1:
+            raise requests.HTTPError("429", response=r)
+        return {"id": "file-1"}
+
+    monkeypatch.setattr(uploader, "query_offset", query_offset)
+    job.update(project_id="p1", upload_url="https://upload/1")
+    assert run(job, FakeBackend(), jobs) == "done"
+
+
+def test_a_briefly_locked_job_file_is_retried_not_lost(tmp_path, monkeypatch):
+    f, jobs, job = enqueue_one(tmp_path)
+    monkeypatch.setattr(uploader, "_io_sleep", lambda s: None)
+    real = os.replace
+    n = {"fails": 3}
+
+    def flaky(a, b):
+        if n["fails"]:
+            n["fails"] -= 1
+            raise PermissionError("locked")
+        return real(a, b)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    job["extra"] = 1
+    uploader._save(job, jobs)
+    assert n["fails"] == 0 and load_one(jobs)["extra"] == 1
+
+
+def test_forget_survives_a_locked_file(tmp_path, monkeypatch):
+    f, jobs, job = enqueue_one(tmp_path)
+    monkeypatch.setattr(uploader, "_io_sleep", lambda s: None)
+
+    def locked(self, missing_ok=False):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(uploader.Path, "unlink", locked)
+    uploader._forget(job, jobs)  # must not raise
+    assert len(queued(jobs)) == 1

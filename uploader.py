@@ -57,6 +57,20 @@ def media_duration(path):
 
 # --- the queue ---------------------------------------------------------------
 
+_io_sleep = time.sleep  # tests replace it
+
+
+def _io_retry(op, attempts=5):
+    """Windows refuses a replace/unlink while another process (antivirus, a reader) has the file open."""
+    for i in range(attempts):
+        try:
+            return op()
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            _io_sleep(0.05 * (i + 1))
+
+
 def _job_file(job, jobs_dir) -> Path:
     return Path(jobs_dir) / f"{job['job_id']}.json"
 
@@ -68,11 +82,14 @@ def _save(job, jobs_dir) -> None:
         json.dump(job, f)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    _io_retry(lambda: os.replace(tmp, path))
 
 
 def _forget(job, jobs_dir) -> None:
-    _job_file(job, jobs_dir).unlink(missing_ok=True)
+    try:
+        _io_retry(lambda: _job_file(job, jobs_dir).unlink(missing_ok=True))
+    except OSError as e:  # still locked: leave it; a repeat of a finished job is harmless
+        log.warning("could not remove job file (%s); left for the next pass", type(e).__name__)
 
 
 def _pending(jobs_dir) -> list:
@@ -240,6 +257,10 @@ def _retry(step, sleep, stop, state):
         except requests.RequestException as e:
             # Exception text can carry the upload URL: log only the kind and status.
             status = getattr(getattr(e, "response", None), "status_code", None)
+            if status is not None and 400 <= status < 500 and status not in (408, 429):
+                # Permanent (e.g. 403 storageQuotaExceeded): retrying forever helps nobody.
+                raise Refused(f"Upload to Drive failed: {status} {getattr(e.response, 'reason', '') or ''}".strip(),
+                              status) from None
             log.warning("%s (%s); retry %d", type(e).__name__, status, state["attempt"] + 1)
         if stop():
             return _STOPPED

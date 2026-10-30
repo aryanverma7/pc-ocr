@@ -413,6 +413,38 @@ def grab_region(region: dict):
     return ImageGrab.grab(bbox=region_bbox(region))
 
 
+def try_grab(region: dict):
+    """grab_region, or None when Windows refuses the screen (UAC prompt, lock screen)."""
+    try:
+        return grab_region(region)
+    except OSError:
+        return None
+
+
+class BuyPhase:
+    """The phase id and burst generation, read and changed together (fix #13).
+
+    on_b_down runs on the keyboard thread: without one lock the main loop could
+    read the new generation (trigger() bumped it) with the old phase id, and the
+    Mac Mini would treat that capture as part of the previous round.
+    """
+
+    def __init__(self):
+        self.id = 0
+        self._lock = threading.Lock()
+
+    def press(self, burst) -> bool:
+        with self._lock:
+            new = burst.trigger()
+            if new:
+                self.id += 1
+            return new
+
+    def snapshot(self, burst) -> "tuple[int, int]":
+        with self._lock:
+            return burst.generation, self.id
+
+
 def capture_and_send(config: dict, cropped=None, buy_phase: "int | None" = None) -> "int | None":
     """
     Returns the response's HTTP status code, or None if the request itself
@@ -601,10 +633,10 @@ def main():
     # #10. Monotonic within one run of this process; the Mac Mini only ever
     # compares it for equality, never for order, so a restart that sends 1
     # again reads correctly as "a different phase from the last one".
-    buy_phase_id = 0
+    phase = BuyPhase()
 
     def on_b_down(_):
-        nonlocal b_is_down, buy_phase_id
+        nonlocal b_is_down
         if b_is_down:
             return
         b_is_down = True
@@ -613,8 +645,7 @@ def main():
         # agent believed this was a new round or another look at the one
         # already in progress, which is exactly the judgement fix #10 moved
         # onto the clock.
-        if burst.trigger():
-            buy_phase_id += 1
+        if phase.press(burst):
             print("New buy phase - capturing.")
         else:
             print(f"Buy menu opened again within {new_round_gap}s - same buy phase, keeping its readings.")
@@ -717,7 +748,7 @@ def main():
                 if burst.consume_fresh_start():
                     # A genuinely NEW buy phase, not just re-opening the
                     # same one - the real fix for cross-round contamination.
-                    reset_history(config, buy_phase=buy_phase_id)
+                    reset_history(config, buy_phase=phase.snapshot(burst)[1])
                     with tracker_lock:
                         failure_tracker.reset()
 
@@ -744,8 +775,13 @@ def main():
                             was_saturated = False
                         # Grab happens right here, on-schedule, every tick -
                         # never delayed by a busy worker or a slow backend.
-                        cropped = grab_region(config["region"])
-                        executor.submit(send_in_background, config, cropped, burst.generation, buy_phase_id)
+                        cropped = try_grab(config["region"])
+                        if cropped is None:
+                            with pending_lock:
+                                pending_captures -= 1
+                        else:
+                            generation, phase_id = phase.snapshot(burst)
+                            executor.submit(send_in_background, config, cropped, generation, phase_id)
 
                 # Well under one capture interval, so the tick above lands
                 # on time rather than one sleep late - at the old 0.05s this
