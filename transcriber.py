@@ -121,6 +121,9 @@ def run_job(job, backend, http, should_abort, spawn=subprocess.Popen, workdir=WO
     if iid <= 0 or str(iid) != str(job["iteration_id"]).strip():
         log.error("job with a malformed version id dropped")
         return "failed"
+    if not all(isinstance(job.get(k), str) and job.get(k) for k in ("token", "file_id", "access_token")):
+        log.error("version %s: job without its token, file or Drive token; dropped (the backend re-queues it)", iid)
+        return "failed"
     token = job["token"]
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)

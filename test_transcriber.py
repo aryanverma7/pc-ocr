@@ -234,3 +234,11 @@ def test_an_error_in_the_abort_check_still_kills_the_worker(tmp_path):
                             workdir=tmp_path, clock=_clock())
     assert procs[0].killed
     assert list(tmp_path.iterdir()) == []
+
+
+def test_job_missing_a_field_is_dropped_not_raised(tmp_path):
+    for k in ("token", "file_id", "access_token"):
+        job = {**JOB}
+        job.pop(k)
+        assert transcriber.run_job(job, FakeBackend(), FakeHttp(), lambda: False, workdir=tmp_path / "w") == "failed"
+    assert not (tmp_path / "w").exists()
