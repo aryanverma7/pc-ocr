@@ -200,3 +200,17 @@ def test_status_check_stops_on_paused_or_live_and_not_on_failure():
         def status(self):
             raise OSError("down")
     assert transcriber.status_says_stop(Down(), clock=lambda: 0.0)() is False
+
+
+def test_block_list_needs_a_list_of_names():
+    assert transcriber.block_list({}) == list(transcriber.DEFAULT_GAMES)
+    assert transcriber.block_list({"transcriber_block_processes": ["cs2.exe"]}) == ["cs2.exe"]
+    for bad in ("cs2.exe", [], [""], [3], {"a": 1}):
+        assert transcriber.block_list({"transcriber_block_processes": bad}) == list(transcriber.DEFAULT_GAMES)
+
+
+def test_malformed_iteration_id_never_becomes_a_path(tmp_path):
+    for bad in ("..\\..\\x", "../x", "1/2", None, -3, "7 ; x"):
+        assert transcriber.run_job({"iteration_id": bad, "token": "t"}, None, None, lambda: False,
+                                   workdir=tmp_path / "w") == "failed"
+    assert not (tmp_path / "w").exists()

@@ -100,9 +100,28 @@ def _download(http, job, dest, abort) -> None:
                     raise _Aborted()
 
 
+def block_list(cfg) -> list:
+    """The game processes that keep the GPU ours to leave alone: a list of names, else the default."""
+    v = cfg.get("transcriber_block_processes")
+    if v is None:
+        return list(DEFAULT_GAMES)
+    if isinstance(v, list) and v and all(isinstance(x, str) and x.strip() for x in v):
+        return v
+    log.warning("transcriber_block_processes must be a list of process names; using %s", DEFAULT_GAMES)
+    return list(DEFAULT_GAMES)
+
+
 def run_job(job, backend, http, should_abort, spawn=subprocess.Popen, workdir=WORK_DIR,
             clock=time.monotonic, sleep=time.sleep) -> str:
-    iid, token = job["iteration_id"], job["token"]
+    try:  # it becomes a file name: only a plain number may
+        iid = int(job["iteration_id"])
+    except (TypeError, ValueError):
+        log.error("job with a malformed version id dropped")
+        return "failed"
+    if iid <= 0 or str(iid) != str(job["iteration_id"]).strip():
+        log.error("job with a malformed version id dropped")
+        return "failed"
+    token = job["token"]
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     media, out, err = (workdir / f"{iid}{ext}" for ext in (".media", ".json", ".err"))
@@ -223,7 +242,7 @@ def main() -> int:
     lock = try_lock(WORK_DIR)
     if lock is None:
         return 0  # already running
-    games = cfg.get("transcriber_block_processes") or DEFAULT_GAMES
+    games = block_list(cfg)
     http = requests.Session()
     backend = TranscriberBackend(base, secret, http)
     gate = IdleGate(game=lambda: game_running(games))
