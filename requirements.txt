@@ -16,6 +16,7 @@ pystray>=0.19.5  # the tray icon showing upload progress
 pymediainfo>=6.1.0  # reads a video's length (under 5 minutes = clip)
 # transcriber.py (Hinglish transcripts on the GPU):
 faster-whisper>=1.1
+av<16  # the newest PyAV dropped open(metadata_errors=), which faster-whisper still passes
 nvidia-cublas-cu12  # CUDA 12 runtime for CTranslate2, no CUDA toolkit install needed
 nvidia-cudnn-cu12==9.*
 
