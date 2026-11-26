@@ -35,3 +35,6 @@ desktop.ini
 .idea/
 # Uploader job files (they hold upload session URLs) and its log
 uploads/
+# Transcriber temp files, its log, and the converted model (1.6 GB; copied by hand)
+transcripts/
+models/
