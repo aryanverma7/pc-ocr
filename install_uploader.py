@@ -1,6 +1,7 @@
 """
 Adds "Send to editor" to Explorer's right-click menu for video files, and runs
-the uploader at logon so a queue cut short by a power cut carries on.
+the uploader at logon so a queue cut short by a power cut carries on, and the
+transcriber at logon.
 
 Current user only (HKCU), so no admin rights are needed.
     python install_uploader.py              install
@@ -12,7 +13,9 @@ import sys
 VERB_KEY = r"Software\Classes\SystemFileAssociations\video\shell\DualBladeXSendToEditor"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "DualBladeXUploader"
+TRANSCRIBER_VALUE = "DualBladeXTranscriber"
 UPLOADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploader.py")
+TRANSCRIBER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcriber.py")
 
 
 def command_for(pythonw: str, script: str, arg: str) -> str:
@@ -38,7 +41,9 @@ def install() -> None:
     print('Added "Send to editor" to the right-click menu for video files.')
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
         winreg.SetValueEx(k, RUN_VALUE, 0, winreg.REG_SZ, f'"{pythonw}" "{UPLOADER}" --resume')
+        winreg.SetValueEx(k, TRANSCRIBER_VALUE, 0, winreg.REG_SZ, f'"{pythonw}" "{TRANSCRIBER}"')
     print("Unfinished uploads will resume at every login.")
+    print("The transcriber starts at every login.")
 
 
 def uninstall() -> None:
@@ -50,12 +55,13 @@ def uninstall() -> None:
         except FileNotFoundError:
             pass
     print('Removed "Send to editor" from the right-click menu.')
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
-            winreg.DeleteValue(k, RUN_VALUE)
-    except FileNotFoundError:
-        pass
-    print("Removed the resume-at-login entry.")
+    for value in (RUN_VALUE, TRANSCRIBER_VALUE):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, value)
+        except FileNotFoundError:
+            pass
+    print("Removed the resume-at-login and transcriber-at-login entries.")
 
 
 if __name__ == "__main__":

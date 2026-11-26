@@ -71,3 +71,41 @@ A small icon in the system tray shows progress.
   ID and client secret in the dashboard's Settings, and the end of
   `uploads\uploader.log`. If the Mac Mini can't reach Twitch, it uploads anyway.
 - **Anything else**: look at the end of `uploads\uploader.log`.
+
+## Transcripts
+
+The transcriber makes Hinglish transcripts of review versions on this PC's
+graphics card, only while the PC is idle. It starts at every login (step 3
+above adds it) and shows no window.
+
+**One-time setup** (after steps 1 to 3):
+
+1. Get the converted model folder `hinglish-apex-ct2` (about 1.6 GB) and put it
+   at `models\hinglish-apex-ct2` inside the agent folder. To make it yourself,
+   run this once anywhere `uv` is installed (WSL is fine), then copy the
+   `models` folder across:
+
+   ```
+   uv run --no-project --with "transformers[torch]" --with ctranslate2 python convert_model.py
+   ```
+
+2. Start it once by hand (afterwards it starts at login):
+
+   ```
+   pythonw transcriber.py
+   ```
+
+**Using it**
+
+- Nothing happens until someone sets **Transcriber: On** in the editor's top
+  bar (it starts Paused). **Auto for new versions** queues every new version;
+  otherwise use **Make transcript** on a version.
+- A transcript starts only when you are not live, nothing is full screen, no
+  listed game is running and the graphics card has been nearly idle for 10
+  minutes. Starting a game, going full screen, going live or switching it to
+  Paused stops it within seconds; the version goes back in the queue.
+- Games that block it: `VALORANT-Win64-Shipping.exe` by default. To change the
+  list, add to `agent_config.json`:
+  `"transcriber_block_processes": ["VALORANT-Win64-Shipping.exe", "cs2.exe"]`
+- The log is `transcripts\transcriber.log` in the agent folder. Temporary
+  files there are deleted after every job.
