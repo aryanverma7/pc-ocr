@@ -157,16 +157,19 @@ def run_job(job, backend, http, should_abort, spawn=subprocess.Popen, workdir=WO
         with open(err, "wb") as err_fh:
             proc = spawn([sys.executable, str(WORKER), str(media), str(out), str(MODEL_DIR)],
                          stdout=subprocess.DEVNULL, stderr=err_fh, creationflags=NO_WINDOW)
-            while True:
-                try:
-                    code = proc.wait(timeout=ABORT_CHECK_SECONDS)
-                    break
-                except subprocess.TimeoutExpired:
-                    if abort():
-                        proc.kill()
-                        proc.wait()
-                        log.info("version %s: stopped (game, full screen, live or paused); handed back", iid)
-                        return release()
+            try:
+                while True:
+                    try:
+                        code = proc.wait(timeout=ABORT_CHECK_SECONDS)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if abort():
+                            log.info("version %s: stopped (game, full screen, live or paused); handed back", iid)
+                            return release()
+            finally:  # whatever ends this wait (abort, an error in the check), the worker never outlives it
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
         if code != 0:
             tail = err.read_text(encoding="utf-8", errors="replace")[-2000:]
             log.error("version %s: worker exited %s:\n%s", iid, code, tail)

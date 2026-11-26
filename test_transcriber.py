@@ -57,7 +57,10 @@ class FakeProc:
     """Exits with `code` after `waits` timed-out waits, writing the worker's JSON first."""
 
     def __init__(self, args, code, waits):
-        self.out, self.code, self.waits, self.killed = Path(args[3]), code, waits, False
+        self.out, self.code, self.waits, self.killed, self.done = Path(args[3]), code, waits, False, False
+
+    def poll(self):
+        return (-9 if self.killed else self.code) if self.done or self.killed else None
 
     def wait(self, timeout=None):
         if self.killed:
@@ -67,6 +70,7 @@ class FakeProc:
             raise subprocess.TimeoutExpired("worker", timeout)
         if self.code == 0:
             self.out.write_text(json.dumps({"segments": SEGS, "model": "hinglish-apex-ct2"}))
+        self.done = True
         return self.code
 
     def kill(self):
@@ -214,3 +218,19 @@ def test_malformed_iteration_id_never_becomes_a_path(tmp_path):
         assert transcriber.run_job({"iteration_id": bad, "token": "t"}, None, None, lambda: False,
                                    workdir=tmp_path / "w") == "failed"
     assert not (tmp_path / "w").exists()
+
+
+def test_an_error_in_the_abort_check_still_kills_the_worker(tmp_path):
+    procs, backend = [], FakeBackend()
+    asks = iter([False])  # the download's check passes; the first check while transcribing raises
+
+    def should_abort():
+        try:
+            return next(asks)
+        except StopIteration:
+            raise RuntimeError("status check blew up") from None
+    with pytest.raises(RuntimeError):
+        transcriber.run_job(JOB, backend, FakeHttp(), should_abort, spawn=_spawn(waits=5, record=procs),
+                            workdir=tmp_path, clock=_clock())
+    assert procs[0].killed
+    assert list(tmp_path.iterdir()) == []
